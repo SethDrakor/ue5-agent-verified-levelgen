@@ -102,13 +102,7 @@ generation or Blueprint editing.
 ## Proof, not just claims
 
 `run_verify()` on the actual project level — 11 automated checks, screenshot
-included, before a single `save()` is allowed to happen. See `media/Run_Verify.png`
-and `media/TEST SUITE — HorrorGame Plugin.png` for the anti-regression suite
-catching a real, deliberately-triggered regression and then passing clean.
-
-See `docs/ARCHITECTURE.md` for a deeper technical breakdown and
-`docs/KNOWN_ISSUES.md` for the undocumented UE5.7 bugs found and fixed along
-the way.ppen:
+included, before a single `save()` is allowed to happen:
 
 ![run_verify() passing](media/run_verify_passing.png)
 
