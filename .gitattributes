@@ -1,0 +1,14 @@
+# Without this file, Windows Git (core.autocrlf) and Linux/macOS Git disagree
+# on line endings for every text file, which is exactly what surfaced as
+# spurious "modified" files after this session's commits (made from a Linux
+# environment) were pulled on Windows. Forcing LF here isn't just cosmetic:
+# scripts/hooks/pre-commit is a shell script executed via its #!/usr/bin/env
+# bash shebang — if autocrlf ever converts it to CRLF, Git Bash fails to run
+# it at all ("bad interpreter"), silently disabling the safety net this repo
+# just added. LF, unconditionally, for every text file, on every platform.
+
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.jpeg binary
