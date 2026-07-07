@@ -1003,7 +1003,7 @@ def run_steps(steps, stop_on_error=True, auto_save=True, verbose=True):
             "Vérifier": "print(f'{len(all_actors())} acteurs total')",
         })
     """
-    import io, sys, traceback, datetime
+    import io, sys, traceback
 
     shared = {}
     exec("from ue5_utils import *\nimport unreal", shared)
@@ -1238,7 +1238,6 @@ def update_memory(section, content):
 
 def append_todo(item):
     """Ajoute un item TODO dans GAME_MEMORY.md."""
-    import re
     path = _memory_path()
     with open(path, encoding="utf-8") as f:
         text = f.read()
@@ -1271,7 +1270,7 @@ def memory_snapshot():
         lines = f.readlines()
     todos = [l.strip() for l in lines if l.strip().startswith("- [ ]")]
     done  = [l.strip() for l in lines if l.strip().startswith("- [x]")]
-    print(f"=== GAME MEMORY SNAPSHOT ===")
+    print("=== GAME MEMORY SNAPSHOT ===")
     print(f"TODO ({len(todos)}) :")
     for t in todos: print(f"  {t}")
     print(f"DONE ({len(done)}) :")
@@ -1288,4 +1287,112 @@ def safe_append(path, content, must_contain=None):
     if must_contain:
         for needle in (must_contain if isinstance(must_contain, list) else [must_contain]):
             if needle not in written:
-        
+                raise Exception("safe_append ECHEC: '{}' manquant dans {}".format(needle, path))
+    unreal.log("[safe_append] OK {} ({} chars total)".format(os.path.basename(path), len(written)))
+    return len(written)
+
+
+# ══════════════════════════════════════════════════════
+# ANTI-REGRESSION AUTOMATIQUE — safe_modify_plugin()
+# ══════════════════════════════════════════════════════
+#
+# Avant cette fonction, "lancer run_all() avant/apres toute modif C++/Python"
+# n'etait qu'une regle ECRITE dans CLAUDE.md — rien dans le code ne l'imposait.
+# Un agent (ou un humain) pressé pouvait modifier le plugin et sauvegarder sans
+# avoir lancé un seul test, exactement comme il pouvait autrefois appeler save()
+# sans avoir passé run_verify() avant que ce garde-fou existe pour le level design.
+# safe_modify_plugin() transforme cette convention en mécanisme : baseline avant,
+# modification, re-check après, comparaison test par test — pas juste "ça passe
+# globalement" mais "CE test précis, qui passait avant, échoue maintenant".
+
+def safe_modify_plugin(fn, *args, **kwargs):
+    """Encapsule une modification risquée du plugin (C++/Python, BP wiring, etc.)
+    avec un filet de sécurité anti-régression automatique.
+
+    Principe (identique à fix_all()+run_verify() avant save() pour le level design,
+    appliqué ici au CODE du plugin plutôt qu'à la géométrie du niveau) :
+        1. Lance test_suite.run_all() AVANT la modification → baseline.
+        2. Si la baseline elle-même a des échecs → arrêt immédiat (pas de baseline
+           fiable, inutile de comparer après).
+        3. Exécute fn(*args, **kwargs) — la modification à risque.
+        4. Relance test_suite.run_all() APRès la modification.
+        5. Compare test par test (pas juste le score global) : si un test qui
+           était [OK] en baseline est [FAIL] après → régression réelle détectée
+           → lève une Exception. Un test déjà cassé avant qui l'est encore après
+           n'est PAS une régression (ce n'est pas la faute de cette modification).
+
+    fn : callable sans argument obligatoire qui effectue la modification
+         (ex: une fonction qui appelle BPGraph(...).wire_and_compile(), ou qui
+         réimporte un module C++ après recompilation).
+
+    Retourne le résultat de fn() si aucune régression n'est détectée.
+    Lève une Exception si :
+      - la baseline elle-même échoue (tests déjà cassés avant modif — corriger
+        d'abord, ne pas empiler une nouvelle modif sur une base déjà rouge) ;
+      - une régression réelle est détectée après la modif.
+
+    Exemple :
+        def ma_modif():
+            bp = load_bp("/Game/Path/BP_Name")
+            g  = BPGraph(bp, "EventGraph")
+            ev = g.event("BeginPlay")
+            fn = g.call("PrintString", "/Script/Engine.KismetSystemLibrary")
+            ev >> fn
+            return g.wire_and_compile()
+
+        result = safe_modify_plugin(ma_modif)
+        # → lève une Exception si la modif casse un test qui passait avant,
+        #   sinon retourne le "OK: N nodes, M connections" de wire_and_compile().
+    """
+    import sys
+
+    def _reload_and_run(verbose):
+        # Reimport obligatoire : sans ça, un test_suite/ue5_utils déjà en mémoire
+        # masquerait une régression introduite par une recompilation C++ récente
+        # (voir CLAUDE.md — "Cache Python — reimporter apres modif ue5_utils").
+        for m in list(sys.modules):
+            if m in ("ue5_utils", "test_suite"):
+                del sys.modules[m]
+        import test_suite as _ts
+        ok = _ts.run_all(verbose=verbose)
+        snapshot = {name: status for status, name, _ in _ts._results}
+        return ok, snapshot, _ts._OK, _ts._FAIL
+
+    print("[safe_modify_plugin] Baseline AVANT modification...")
+    baseline_ok, baseline, OK_TAG, FAIL_TAG = _reload_and_run(verbose=False)
+    if not baseline_ok:
+        failed = [n for n, s in baseline.items() if s == FAIL_TAG]
+        raise Exception(
+            "[safe_modify_plugin] ARRET : {} test(s) déjà en échec AVANT la "
+            "modification (baseline non fiable) : {}. Corriger l'existant "
+            "d'abord — ne pas modifier sur une base déjà rouge.".format(
+                len(failed), failed))
+    print("[safe_modify_plugin] Baseline OK ({} tests). Exécution de la "
+          "modification...".format(len(baseline)))
+
+    result = fn(*args, **kwargs)
+
+    print("[safe_modify_plugin] Vérification APRÈS modification...")
+    after_ok, after, _, _ = _reload_and_run(verbose=False)
+
+    regressions = [
+        name for name, status in after.items()
+        if baseline.get(name) == OK_TAG and status == FAIL_TAG
+    ]
+
+    if regressions:
+        raise Exception(
+            "[safe_modify_plugin] REGRESSION DETECTEE : {} test(s) passaient "
+            "avant la modification et échouent maintenant : {}. La modification "
+            "N'A PAS été considérée sûre — corriger avant de sauvegarder ou de "
+            "continuer.".format(len(regressions), regressions))
+
+    if not after_ok:
+        still_failing = [n for n, s in after.items() if s == FAIL_TAG]
+        print("[safe_modify_plugin] ATTENTION : {} test(s) toujours en échec, "
+              "mais déjà cassés avant la modif — pas une nouvelle régression : "
+              "{}".format(len(still_failing), still_failing))
+
+    print("[safe_modify_plugin] OK — aucune régression détectée ({} tests).".format(
+        len(after)))
+    return result

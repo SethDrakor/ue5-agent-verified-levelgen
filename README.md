@@ -1,5 +1,7 @@
 # UE5 Agent-Verified Level Generation
 
+[![CI](https://github.com/SethDrakor/ue5-agent-verified-levelgen/actions/workflows/ci.yml/badge.svg)](https://github.com/SethDrakor/ue5-agent-verified-levelgen/actions/workflows/ci.yml)
+
 **A C++/Python toolchain that lets an AI agent drive the Unreal Engine 5 editor
 reliably: procedural geometry generation, scripted Blueprint editing, and
 automatic verification (collisions, materials, NavMesh) before anything is
@@ -112,6 +114,7 @@ The anti-regression suite for the plugin and Python toolchain, 45/45:
 
 ---
 
-*See `docs/ARCHITECTURE.md` for a deeper technical breakdown and
+*See `docs/ARCHITECTURE.md` for a deeper technical breakdown,
 `docs/KNOWN_ISSUES.md` for the undocumented UE5.7 bugs found and fixed along
-the way.*
+the way, and `docs/CI.md` for what the badge above actually checks (and, just
+as deliberately, what it doesn't).*

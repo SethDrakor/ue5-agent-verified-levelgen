@@ -1,0 +1,13 @@
+target-version = "py311"
+
+# python_toolchain is written against the UE5 Editor's embedded Python API
+# (the `unreal` module), not against a linter. Retrofitting full pycodestyle
+# compliance (E/W) onto ~5,000 lines of working editor-automation code is a
+# separate, purely cosmetic project with real risk of introducing whitespace
+# noise into diffs — not something to gate CI on right now.
+#
+# What IS worth gating on: pyflakes (F) checks — undefined names, unused
+# imports/variables, duplicate definitions, unreachable code. Those are
+# real-bug signal regardless of house style.
+[lint]
+select = ["F"]

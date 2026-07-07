@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch: {}
+
+jobs:
+  repo-integrity:
+    name: Repo integrity (structural, stdlib-only)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: No NUL bytes / valid Python / valid JSON / balanced C++ braces
+        run: python3 scripts/check_repo_integrity.py
+
+  doc-references:
+    name: Doc references (README + docs/*.md)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Every referenced file/image actually exists
+        run: python3 scripts/check_doc_references.py
+
+  python-toolchain:
+    name: python_toolchain (import + unit tests + lint)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install test/lint dependencies
+        run: pip install pytest ruff
+      - name: pytest (import smoke tests + OccupancyGrid unit tests)
+        run: pytest tests/ -v
+      - name: ruff (pyflakes rules only — see ruff.toml)
+        run: ruff check --config ruff.toml python_toolchain/ tests/

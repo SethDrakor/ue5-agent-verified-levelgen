@@ -236,7 +236,6 @@ def check_gameplay_completeness(actors):
 def check_duplicates(actors):
     """Détecte les acteurs dupliqués (PostProcess, PlayerStart, etc.)."""
     warnings = []
-    from collections import Counter
     pp_count = sum(1 for a in actors if "PostProcess" in a.get_actor_label())
     ps_count = sum(1 for a in actors if "PlayerStart" in a.get_class().get_name())
     if pp_count > 1:
@@ -269,7 +268,7 @@ def check_navmesh_rebuild(world):
             warnings.append("NAVMESH NON BUILTÉ: faire Build → Build Paths dans UE5 (menu Build en haut)")
         else:
             pass  # NavMesh OK, pas de warning
-    except Exception as e:
+    except Exception:
         # Fallback : vérifier juste que RecastNavMesh-Default existe
         has_recast = any("RecastNavMesh" in a.get_class().get_name()
                          for a in _actors())
@@ -636,4 +635,340 @@ def take_verify_screenshot(name="verify", capture_pos=None):
     return capture_reference_screenshot(x, y, z, pitch=pitch, yaw=yaw, roll=roll, name=name)
 
 
-def capture_a
+def capture_all_zones_screenshots(name_prefix="verify_zone"):
+    """Un screenshot PAR ZONE plutôt qu'un point moyen sur tout le level.
+
+    Bug diagnostiqué le 2026-07-07 sur HorrorLevel : take_verify_screenshot() sans
+    capture_pos explicite prend la moyenne des origins de TOUTE la géométrie du level
+    comme position de caméra. Sur un level à une seule salle (AgentDemo, sa cible
+    d'origine) cette moyenne tombe au centre de la salle — correct. Sur un level
+    multi-zones (HorrorLevel : 9 zones/couloirs sur ~10000 UU en X), la moyenne tombe
+    n'importe où — ici en plein dans le couloir vers Zone 3 — et le screenshot résultant
+    est presque entièrement noir (caméra collée à un mur, vue en tunnel à travers une
+    ouverture lointaine). run_verify() annonçait pourtant "0 erreur, JOUABLE" : le texte
+    du rapport était correct, mais le seul artefact visuel produit ne permettait de
+    juger aucune zone réelle — la boucle vision n'était fermée qu'en apparence.
+
+    Réutilise le même regroupement par zone que check_light_coverage() (préfixe avant
+    "_Wall", couloirs détectés par "corr"/"couloir") pour que screenshot et check de
+    couverture lumière portent exactement sur les mêmes zones. Un point de vue par
+    zone (centre XY, z=170 hauteur des yeux, pitch=0, yaw=180 — convention du projet,
+    voir CLAUDE.md "Screenshot fiable") permet de juger visuellement chaque salle
+    individuellement au lieu d'un seul point arbitraire sur tout le level.
+
+    Retourne {zone_key: chemin_png}.
+    """
+    import re
+    from ue5_utils import capture_reference_screenshot
+
+    actors = _actors()
+    geo_boxes = _get_geo_boxes(actors)
+    wall_boxes = [(lbl, o, e) for lbl, o, e in geo_boxes if "wall" in lbl.lower() or "mur" in lbl.lower()]
+
+    zones_raw = _group_walls_by_zone(wall_boxes)
+
+    paths = {}
+    for zone_key, boxes in zones_raw.items():
+        xs = [o.x for _, o, e in boxes]
+        ys = [o.y for _, o, e in boxes]
+        cx = sum(xs) / len(xs)
+        cy = sum(ys) / len(ys)
+
+        # yaw=180 (regarder vers -X) suppose une salle fermée avec un mur de bout à
+        # l'ouest — correct pour les zones avec des murs Est/Ouest (ou L/R pour un
+        # couloir, où "descendre le couloir" est la vue naturelle). Mais Z3A/Z3B/Z3C
+        # (voir GAME_MEMORY.md layout) n'ont QUE des murs N/S — pas de mur de bout en
+        # X — elles sont ouvertes sur le reste du niveau dans cet axe. Un yaw=180 y
+        # regarde alors à l'infini dans le couloir de jeu entier (vue tunnel jusqu'à
+        # la zone la plus proche encore éclairée), pas la salle elle-même. Pour ces
+        # zones "salle ouverte" (nom ne contenant pas corr/couloir ET aucun mur
+        # E/W/L/R), on tourne la caméra à 90° pour regarder à travers la largeur
+        # contrainte (N à S) à la place — cadrage représentatif de LA zone, pas du
+        # niveau entier vu au travers.
+        has_cap_wall = any(re.search(r"wall(e|w|l|r)\b", lbl, re.IGNORECASE) for lbl, _, _ in boxes)
+        is_corridor_name = bool(re.search(r"corr|couloir", zone_key, re.IGNORECASE))
+        safe_name = re.sub(r"[^A-Za-z0-9_]", "_", zone_key)
+
+        if has_cap_wall or is_corridor_name:
+            yaws = [180]
+        else:
+            # Testé le 2026-07-07 : pour une zone sans mur de bout (ouverte sur le
+            # reste du niveau des deux côtés en X, ex: Z3A/B/C), AUCUN angle fixe
+            # n'est fiable à coup sûr — yaw=180 tombe parfois sur une vue tunnel du
+            # niveau entier, parfois sur le décor réel de la zone (cas Z3B, où
+            # yaw=180 montrait un bon aperçu et yaw=90 était noir total) ; l'inverse
+            # est vrai ailleurs (Z3A). Pas de règle géométrique simple qui distingue
+            # les deux cas à l'avance avec les seules bounding boxes de murs. Plutôt
+            # que de deviner un seul angle et risquer un screenshot inutile, on
+            # capture les deux — coût négligeable (screenshot de vérification, pas
+            # un chemin runtime), et un humain/agent choisit celui qui est lisible.
+            yaws = [180, 90]
+
+        for yaw in yaws:
+            path = capture_reference_screenshot(cx, cy, 170, pitch=0, yaw=yaw, name=f"{name_prefix}_{safe_name}_yaw{yaw}")
+            paths[f"{zone_key}_yaw{yaw}"] = path
+            print(f"  [{zone_key}] centre=({int(cx)},{int(cy)}) yaw={yaw} -> {path}")
+
+    return paths
+
+
+# ──────────────────────────────────────────────
+# Entrée principale
+# ──────────────────────────────────────────────
+
+def run_verify(take_screenshot=True, level_name=None):
+    """Vérifie le level courant et retourne True si jouable.
+
+    Affiche un rapport complet avec erreurs bloquantes et warnings.
+    """
+    world = _world()
+    actors = _actors()
+    geo_boxes = _get_geo_boxes(actors)
+
+    name_str = level_name or world.get_name()
+    print(f"\n{'='*50}")
+    print(f"VERIFY LEVEL — {name_str} ({len(actors)} acteurs)")
+    print(f"{'='*50}")
+
+    all_errors = []
+    all_warnings = []
+
+    # Screenshot en premier (montre l'état avant les checks)
+    screenshot_path = None
+    if take_screenshot:
+        print("\n[1/11] Screenshot viewport...")
+        screenshot_path = take_verify_screenshot(f"verify_{name_str}")
+        if screenshot_path:
+            print(f"      Screenshot: {screenshot_path}")
+        else:
+            all_warnings.append("Screenshot non trouvé (UE5 pas en focus ?)")
+
+    # Checks
+    print("\n[2/11] Positions acteurs (dans géométrie / sol manquant)...")
+    errs = check_actor_positions(actors, world, geo_boxes)
+    all_errors.extend(errs)
+    print(f"      {len(errs)} erreur(s)")
+
+    print("\n[3/11] Tags ennemis...")
+    errs = check_enemy_tags(actors)
+    all_errors.extend(errs)
+    print(f"      {len(errs)} erreur(s)")
+
+    print("\n[4/11] Lumières (radius configuré)...")
+    warns = check_lights(actors)
+    all_warnings.extend(warns)
+    print(f"      {len(warns)} warning(s)")
+
+    print("\n[5/11] Gameplay completeness...")
+    errs = check_gameplay_completeness(actors)
+    all_errors.extend(errs)
+    print(f"      {len(errs)} erreur(s)")
+
+    print("\n[6/11] Doublons...")
+    warns = check_duplicates(actors)
+    all_warnings.extend(warns)
+    print(f"      {len(warns)} warning(s)")
+
+    print("\n[7/11] NavMesh builté...")
+    warns = check_navmesh_rebuild(world)
+    all_warnings.extend(warns)
+    print(f"      {len(warns)} warning(s)")
+
+    print("\n[8/11] Matériaux (défauts restants sur murs/sol/plafond)...")
+    errs, warns = check_materials(actors)
+    all_errors.extend(errs)
+    all_warnings.extend(warns)
+    print(f"      {len(errs)} erreur(s), {len(warns)} warning(s)")
+
+    print("\n[9/11] PostProcess (présence + Lumen désactivé)...")
+    errs = check_postprocess_atmosphere(actors)
+    all_errors.extend(errs)
+    print(f"      {len(errs)} erreur(s)")
+
+    print("\n[10/11] Lumières globales par défaut (SkyLight/DirectionalLight)...")
+    errs = check_default_level_lighting(actors)
+    all_errors.extend(errs)
+    print(f"      {len(errs)} erreur(s)")
+
+    print("\n[11/11] Couverture lumière (le sol est-il vraiment visible ?)...")
+    errs, warns = check_light_coverage(actors, geo_boxes)
+    all_errors.extend(errs)
+    all_warnings.extend(warns)
+    print(f"      {len(errs)} erreur(s), {len(warns)} warning(s)")
+
+    # Rapport final
+    print(f"\n{'='*50}")
+    print("RAPPORT FINAL")
+    print(f"{'='*50}")
+
+    if all_errors:
+        print(f"\n❌ ERREURS BLOQUANTES ({len(all_errors)}) — level NON jouable :")
+        for e in all_errors:
+            print(f"   • {e}")
+    else:
+        print("\n✅ Aucune erreur bloquante")
+
+    if all_warnings:
+        print(f"\n⚠  WARNINGS ({len(all_warnings)}) — level jouable mais imparfait :")
+        for w in all_warnings:
+            print(f"   • {w}")
+    else:
+        print("\n✅ Aucun warning")
+
+    if not all_errors and not all_warnings:
+        print("\n🎮 LEVEL PARFAITEMENT JOUABLE")
+
+    if screenshot_path:
+        print(f"\n📸 Screenshot: {screenshot_path}")
+        print("   (lire avec Read tool pour vérification visuelle)")
+
+    playable = len(all_errors) == 0
+    print(f"\n{'='*50}")
+    print(f"VERDICT: {'JOUABLE ✅' if playable else 'NON JOUABLE ❌'}")
+    print(f"{'='*50}\n")
+    return playable
+
+
+# ──────────────────────────────────────────────
+# Fix automatique des problèmes détectés
+# ──────────────────────────────────────────────
+
+def fix_light_radius(target_radius_map=None):
+    """Corrige les radius de toutes les lumières avec radius=1000 (valeur par défaut).
+
+    target_radius_map : dict {label: radius} pour des valeurs précises.
+    Sans map, applique 400 par défaut à toutes les lumières non configurées.
+
+    Exemple:
+        fix_light_radius({"Z1_Entry_Amber": 320, "Corr_Red": 500})
+    """
+    actors = _actors()
+    fixed = 0
+    for a in actors:
+        if "PointLight" in a.get_class().get_name():
+            lbl = a.get_actor_label()
+            lc = a.point_light_component
+            current = int(lc.get_editor_property("attenuation_radius"))
+            if current >= 1000:
+                target = (target_radius_map or {}).get(lbl, 400)
+                lc.set_editor_property("attenuation_radius", float(target))
+                print(f"  Fixed: {lbl} radius {current} → {target}")
+                fixed += 1
+    print(f"fix_light_radius: {fixed} lumière(s) corrigée(s)")
+    return fixed
+
+
+def fix_enemy_tags():
+    """Ajoute le tag 'Enemy' à tous les BP_IA_Enemy qui ne l'ont pas."""
+    actors = _actors()
+    fixed = 0
+    for a in actors:
+        if "BP_IA_Enemy" in a.get_class().get_name():
+            tags = [str(t) for t in a.tags]
+            if "Enemy" not in tags:
+                a.tags = list(a.tags) + [unreal.Name("Enemy")]
+                print(f"  Fixed: {a.get_actor_label()} — tag 'Enemy' ajouté")
+                fixed += 1
+    print(f"fix_enemy_tags: {fixed} ennemi(s) corrigé(s)")
+    return fixed
+
+
+def fix_duplicate_postprocess():
+    """Supprime les PostProcessVolume en double, garde le premier."""
+    actors = _actors()
+    aeas = _aeas()
+    pp_actors = [a for a in actors if "PostProcess" in a.get_actor_label()]
+    removed = 0
+    for a in pp_actors[1:]:
+        aeas.destroy_actor(a)
+        removed += 1
+    print(f"fix_duplicate_postprocess: {removed} doublon(s) supprimé(s)")
+    return removed
+
+
+def fix_default_materials():
+    """Remplace les matériaux par défaut (BasicShapeMaterial, MI_ProcGrid...) restants
+    sur tout StaticMeshActor structurel, indépendamment du préfixe de zone (filet de
+    sécurité générique, complète _apply_room_materials de horror_presets.py qui exige
+    un préfixe exact).
+
+    Corrigé le 2026-07-07 : la classification wall/floor/ceiling se basait uniquement
+    sur le label, donc les mêmes 22 surfaces à label non standard que check_materials()
+    ratait (Funnel_N, WN_L, *_End...) étaient certes ATTEINTES par la boucle (aucun
+    filtre is_room_surface ici) mais ne matchaient aucune des 3 branches wall/floor/
+    ceiling → jamais réparées silencieusement, `fixed` jamais incrémenté pour elles.
+    Fallback ajouté : _classify_surface_by_geometry() sur la forme réelle de la bounding
+    box quand le label ne dit rien — voir sa docstring pour le détail de la heuristique.
+    """
+    mat_w = unreal.load_asset(MAT_WALL)
+    mat_f = unreal.load_asset(MAT_FLOOR)
+    mat_c = unreal.load_asset(MAT_CEIL)
+    fixed = 0
+    for a in _actors():
+        if "StaticMeshActor" not in a.get_class().get_name():
+            continue
+        label = a.get_actor_label() or ""
+        ll = label.lower()
+        smc = a.get_component_by_class(unreal.StaticMeshComponent.static_class())
+        if not smc:
+            continue
+        mat = smc.get_material(0)
+        mat_name = mat.get_name().lower() if mat else "none"
+        if mat is not None and not any(bad in mat_name for bad in BAD_MATERIAL_KEYWORDS):
+            continue  # déjà un matériau custom, ne pas écraser un choix volontaire
+
+        if "wall" in ll or "mur" in ll:
+            kind = "wall"
+        elif "floor" in ll or "sol" in ll:
+            kind = "floor"
+        elif "ceil" in ll or "plafond" in ll:
+            kind = "ceiling"
+        else:
+            origin, extent = a.get_actor_bounds(False)
+            kind = _classify_surface_by_geometry(a.get_actor_location(), extent)
+
+        if kind == "wall" and mat_w:
+            smc.set_material(0, mat_w); fixed += 1
+        elif kind == "floor" and mat_f:
+            smc.set_material(0, mat_f); fixed += 1
+        elif kind == "ceiling" and mat_c:
+            smc.set_material(0, mat_c); fixed += 1
+    print(f"fix_default_materials: {fixed} surface(s) corrigée(s)")
+    return fixed
+
+
+def fix_global_lights():
+    """Éteint SkyLight/DirectionalLight à leur valeur par défaut (workflow CLAUDE.md
+    étape 1 : 'Éteindre lumières globales'). N'y touche pas si déjà à 0."""
+    fixed = 0
+    for a in _actors():
+        cls = a.get_class().get_name()
+        if "SkyLight" in cls:
+            c = a.get_component_by_class(unreal.SkyLightComponent.static_class())
+            if c and c.get_editor_property("intensity") > 0.5:
+                c.set_editor_property("intensity", 0.0)
+                fixed += 1
+        elif "DirectionalLight" in cls:
+            c = a.get_component_by_class(unreal.DirectionalLightComponent.static_class())
+            if c and c.get_editor_property("intensity") > 0.5:
+                c.set_editor_property("intensity", 0.0)
+                fixed += 1
+    print(f"fix_global_lights: {fixed} lumière(s) globale(s) éteinte(s)")
+    return fixed
+
+
+def fix_all():
+    """Applique tous les correctifs automatiques disponibles."""
+    print("=== FIX ALL ===")
+    fix_light_radius()
+    fix_enemy_tags()
+    fix_duplicate_postprocess()
+    fix_default_materials()
+    fix_global_lights()
+    print("fix_all terminé — relancer run_verify() pour confirmer")
+    print("NOTE: fix_all ne peut PAS créer un PostProcessVolume manquant ni désactiver")
+    print("      Lumen à ta place — si run_verify() signale POSTPROCESS ABSENT ou")
+    print("      LUMEN ACTIF, utiliser setup_global_atmosphere(style) de horror_presets.py")
+
+
+print("[verify_level] loaded — from verify_level import run_verify, fix_all")

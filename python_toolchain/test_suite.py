@@ -165,7 +165,7 @@ def _test_bgh(bp):
 
 def _test_ue5_utils(bp):
     try:
-        from ue5_utils import aeas, bpes, bgh, BPGraph, load_bp, compile_bp
+        from ue5_utils import aeas, bpes, bgh, BPGraph, compile_bp
     except Exception as e:
         _results.append((_FAIL, "ue5_utils import", str(e)))
         return
@@ -557,4 +557,267 @@ def _test_capture_all_zones_screenshots():
 
 
 def _test_check_materials_geometry_fallback():
-    """Garde contre le b
+    """Garde contre le bug reel decouvert le 2026-07-07 sur BoucherieLevel (session de
+    fermeture de la boucle vision) : 22 surfaces structurelles a label NON STANDARD
+    ("Funnel_N", "WN_L", "*_End"...) portaient encore WorldGridMaterial, mais
+    check_materials() ne les detectait pas (filtre par mots-cles wall/floor/ceil/mur/
+    sol/plafond, aucun ne matchait) ET fix_default_materials() ne les reparait pas
+    (meme filtre pour choisir le materiau de remplacement) — "0 erreur materiaux" sur
+    un level qui avait en realite 22 surfaces au damier gris par defaut.
+
+    Corrige : check_materials() ne filtre plus par label (scanne TOUT StaticMeshActor —
+    BAD_MATERIAL_KEYWORDS est deja un signal suffisamment specifique en soi) et
+    fix_default_materials() utilise _classify_surface_by_geometry() (forme de la
+    bounding box) comme filet de secours quand le label ne dit rien.
+    """
+    try:
+        from verify_level import check_materials, fix_default_materials, _classify_surface_by_geometry
+        from ue5_utils import place_static_mesh, destroy
+    except Exception as e:
+        _results.append((_FAIL, "check_materials geometry fallback import", str(e)))
+        return
+
+    # Mur fin (thin axis = X) avec un label NE contenant AUCUN des mots-cles habituels —
+    # reproduit exactement la forme/le nommage de "Z1_Funnel_N"/"Z1_WN_L"/"*_End" sur
+    # BoucherieLevel.
+    wall = place_static_mesh("/Engine/BasicShapes/Cube.Cube",
+                              _TEST_FAR_X, _TEST_FAR_Y, 150,
+                              sx=0.2, sy=1.5, sz=1.5, label="_TestSuite_OddNamedSurface")
+    try:
+        _test("check_materials geometry fallback - acteur de test cree",
+              lambda: wall is not None)
+        if wall is None:
+            return
+
+        smc = wall.get_component_by_class(unreal.StaticMeshComponent.static_class())
+        grid_mat = unreal.load_asset("/Engine/EngineMaterials/WorldGridMaterial")
+        smc.set_material(0, grid_mat)
+
+        _test("_classify_surface_by_geometry - detecte un mur a partir de sa forme seule",
+              lambda: _classify_surface_by_geometry(
+                  wall.get_actor_location(), wall.get_actor_bounds(False)[1]) == "wall")
+
+        errors, mat_warnings = check_materials([wall])
+        _test("check_materials - detecte le materiau par defaut MEME SANS mot-cle dans "
+              "le label (ex-bug BoucherieLevel : 22 surfaces jamais vues)",
+              lambda: any("_TestSuite_OddNamedSurface" in e for e in errors))
+        _test("check_materials - classe une surface en forme de mur comme ERREUR bloquante "
+              "(pas juste un warning cosmetique)",
+              lambda: any("_TestSuite_OddNamedSurface" in e for e in errors) and
+                      not any("_TestSuite_OddNamedSurface" in w for w in mat_warnings))
+
+        n_fixed = fix_default_materials()
+        _test("fix_default_materials - a corrige au moins 1 surface (notre acteur de test inclus)",
+              lambda: n_fixed >= 1)
+
+        mat_after = smc.get_material(0)
+        mat_name_after = mat_after.get_name().lower() if mat_after else "none"
+        _test("fix_default_materials - surface non standard reparee via le fallback geometrique",
+              lambda: "worldgrid" not in mat_name_after and "basicshape" not in mat_name_after)
+    finally:
+        if wall is not None:
+            destroy(wall)
+
+    # Cas oppose : garde contre la regression trouvee EN CORRIGEANT le bug ci-dessus sur
+    # HorrorLevel (2026-07-07) — retirer le filtre de label a aussi fait remonter des props
+    # de gameplay compacts (Table_Z2, Cover_1..8) au meme niveau BLOQUANT qu'un vrai mur,
+    # rendant tout HorrorLevel "NON JOUABLE" pour un cover au damier gris cosmetique. Un
+    # prop compact (pas plat/allonge) avec materiau par defaut doit rester un WARNING.
+    prop = place_static_mesh("/Engine/BasicShapes/Cube.Cube",
+                              _TEST_FAR_X + 3000, _TEST_FAR_Y, 50,
+                              sx=1.0, sy=1.0, sz=1.0, label="_TestSuite_CompactProp")
+    try:
+        _test("check_materials geometry fallback - prop compact de test cree",
+              lambda: prop is not None)
+        if prop is None:
+            return
+
+        psmc = prop.get_component_by_class(unreal.StaticMeshComponent.static_class())
+        psmc.set_material(0, unreal.load_asset("/Engine/EngineMaterials/WorldGridMaterial"))
+
+        _test("_classify_surface_by_geometry - ne classe PAS un cube compact comme mur/sol/plafond",
+              lambda: _classify_surface_by_geometry(
+                  prop.get_actor_location(), prop.get_actor_bounds(False)[1]) is None)
+
+        errors2, warnings2 = check_materials([prop])
+        _test("check_materials - un prop compact au materiau par defaut est un WARNING, "
+              "pas une erreur bloquante (ex-regression HorrorLevel : Table_Z2/Cover_1..8)",
+              lambda: any("_TestSuite_CompactProp" in w for w in warnings2) and
+                      not any("_TestSuite_CompactProp" in e for e in errors2))
+    finally:
+        if prop is not None:
+            destroy(prop)
+
+
+def _test_capture_pipeline_selftest():
+    """Garde contre la regression du doute jamais reconfirme depuis la session
+    'quinquies' (GAME_MEMORY.md 2026-07-03) : capture_reference_screenshot() avait ete
+    suspectee de renvoyer des images pixel-identiques quel que soit l'etat de la scene
+    (7 captures consecutives identiques malgre des changements radicaux). Resolu le
+    2026-07-07 par un test canari manuel (baseline vs changement de scene reel, diff
+    MD5) — ce test verifie que le mecanisme lui-meme (capture_pipeline_selftest())
+    continue de fonctionner et de nettoyer derriere lui, pour qu'un futur agent puisse
+    revalider la fiabilite du pipeline en un seul appel sans reinventer le test a la main.
+    """
+    try:
+        from ue5_utils import capture_pipeline_selftest
+    except Exception as e:
+        _results.append((_FAIL, "capture_pipeline_selftest import", str(e)))
+        return
+
+    r = capture_pipeline_selftest(cleanup=True)
+
+    try:
+        _test("capture_pipeline_selftest - retourne baseline et after",
+              lambda: bool(r.get("baseline")) and bool(r.get("after")))
+        _test("capture_pipeline_selftest - detecte bien une difference de scene",
+              lambda: r.get("identical") is False)
+        _test("capture_pipeline_selftest - aucun residu CANARY_ apres cleanup",
+              lambda: not any(
+                  a.get_actor_label() and a.get_actor_label().startswith("CANARY_")
+                  for a in unreal.get_editor_subsystem(unreal.EditorActorSubsystem).get_all_level_actors()
+              ))
+    finally:
+        for key in ("baseline", "after"):
+            p = r.get(key) if r else None
+            if p and os.path.exists(p):
+                try:
+                    os.remove(p)
+                except Exception:
+                    pass
+
+
+# ─────────────────────────────────────────────────────────────
+# Test MANUEL (PAS appele par run_all()) — bake_lighting()/unbake_lighting()
+# ─────────────────────────────────────────────────────────────
+# Volontairement exclu du chemin automatique (run_all(), donc aussi
+# wire_and_compile()/safe_modify_plugin()) : un bake reel meme en quality=
+# "preview" a mesure ~8.4s sur ce level (voir GAME_MEMORY.md session 12) —
+# double a ~17s dans le mecanisme avant/apres, et touche reellement les
+# donnees d'eclairage du niveau ENTIER (pas juste une fixture isolee comme
+# les autres tests). A appeler explicitement apres toute modification de
+# bake_lighting()/unbake_lighting() dans ue5_utils.py :
+#   from test_suite import test_bake_lighting_mobility
+#   test_bake_lighting_mobility()
+
+def test_bake_lighting_mobility():
+    """Garde contre 2 pieges deja documentes dans CLAUDE.md/ue5_utils.py :
+    piege n°1 — une lumiere Movable ignore totalement un bake (donc bake_lighting()
+    DOIT basculer la mobilite en Stationary avant de bake) ; piege n°2 — ce pipeline
+    utilise Movable partout par choix delibere, donc unbake_lighting() doit pouvoir
+    revenir proprement en Movable apres un bake ponctuel.
+    """
+    try:
+        from ue5_utils import point_light, bake_lighting, unbake_lighting, destroy
+    except Exception as e:
+        unreal.log_error(f"[FAIL] bake_lighting import: {e}")
+        return False
+
+    local_results = []
+
+    def _t(name, fn):
+        try:
+            ok = fn()
+            local_results.append((_OK if ok else _FAIL, name, "" if ok else "returned falsy"))
+        except Exception as e:
+            local_results.append((_FAIL, name, str(e)))
+
+    pl = point_light(_TEST_FAR_X, _TEST_FAR_Y, 500, intensity=500,
+                      rgb=(255, 255, 255), radius=300, label="_TestSuite_BakeLight")
+    try:
+        _t("bake_lighting - acteur de test cree", lambda: pl is not None)
+        if pl is None:
+            return False
+        lc = pl.point_light_component
+
+        _t("bake_lighting - mobilite initiale MOVABLE",
+           lambda: lc.get_editor_property("mobility") == unreal.ComponentMobility.MOVABLE)
+
+        ok = bake_lighting(labels=["_TestSuite_BakeLight"], quality="preview",
+                            with_reflection_captures=False)
+        _t("bake_lighting - build_light_maps reussi", lambda: ok)
+        _t("bake_lighting - mobilite basculee en STATIONARY avant bake (ex-piege n°1)",
+           lambda: lc.get_editor_property("mobility") == unreal.ComponentMobility.STATIONARY)
+
+        unbake_lighting(labels=["_TestSuite_BakeLight"])
+        _t("unbake_lighting - mobilite revenue en MOVABLE (ex-piege n°2)",
+           lambda: lc.get_editor_property("mobility") == unreal.ComponentMobility.MOVABLE)
+    finally:
+        if pl is not None:
+            destroy(pl)
+
+    passed = sum(1 for s, _, _ in local_results if s == _OK)
+    failed = sum(1 for s, _, _ in local_results if s == _FAIL)
+    total = len(local_results)
+
+    unreal.log("=" * 55)
+    unreal.log("  TEST MANUEL — bake_lighting() / unbake_lighting()")
+    unreal.log("=" * 55)
+    for status, name, msg in local_results:
+        line = f"  {status} {name}"
+        if msg:
+            line += f"  ({msg})"
+        if status == _OK:
+            unreal.log(line)
+        else:
+            unreal.log_error(line)
+    icon = "TOUT OK" if failed == 0 else f"{failed} ECHEC(S) !"
+    unreal.log(f"  {passed}/{total} passes → {icon}")
+    unreal.log("=" * 55)
+
+    return failed == 0
+
+
+# ─────────────────────────────────────────────────────────────
+# Point d'entree
+# ─────────────────────────────────────────────────────────────
+
+def run_all(verbose=True):
+    global _results
+    _results = []
+
+    if not _create_test_bp():
+        unreal.log_error("[TEST SUITE] Impossible de creer le BP de test")
+        return False
+
+    bp = _bp_test
+
+    _test_bpes(bp)
+    _test_batch_wire(bp)
+    _test_bgh(bp)
+    _test_ue5_utils(bp)
+
+    _cleanup()
+
+    _test_point_light()
+    _test_safe_spawn_enemy()
+    _test_occupancy_grid_skydome_guard()
+    _test_load_bp_class()
+    _test_capture_reference_screenshot()
+    _test_occupancy_grid_unit()
+    _test_group_walls_by_zone()
+    _test_capture_all_zones_screenshots()
+    _test_check_materials_geometry_fallback()
+    _test_capture_pipeline_selftest()
+
+    passed = sum(1 for s, _, _ in _results if s == _OK)
+    failed = sum(1 for s, _, _ in _results if s == _FAIL)
+    skipped= sum(1 for s, _, _ in _results if s == _SKIP)
+    total  = len(_results)
+
+    if verbose:
+        unreal.log("=" * 55)
+        unreal.log("  TEST SUITE — HorrorGame Plugin")
+        unreal.log("=" * 55)
+        for status, name, msg in _results:
+            line = f"  {status} {name}"
+            if msg: line += f"  ({msg})"
+            if status == _OK:   unreal.log(line)
+            elif status == _SKIP: unreal.log(line)
+            else:               unreal.log_error(line)
+        unreal.log("=" * 55)
+        icon = "TOUT OK" if failed == 0 else f"{failed} ECHEC(S) !"
+        unreal.log(f"  {passed}/{total} passes  {skipped} skips  → {icon}")
+        unreal.log("=" * 55)
+
+    return failed == 0
