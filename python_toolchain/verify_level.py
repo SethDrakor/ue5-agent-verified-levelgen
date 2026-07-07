@@ -111,40 +111,56 @@ def check_actor_positions(actors, world, geo_boxes):
     Couche 1 — sphere_overlap_actors : collision UE5 réelle (pas d'approximation AABB).
     Couche 2 — line trace sol : détecte les acteurs sans plancher sous les pieds.
     Fallback AABB si sphere_overlap_actors n'est pas disponible dans ce contexte.
+
+    IMPORTANT (corrigé 2026-07-07) : Couche 1 ne s'applique qu'aux acteurs "physiques"
+    (Enemy/PlayerStart/JumpScare — quelque chose qui a réellement une présence physique,
+    ou dont la capsule joueur va spawner à cet endroit). Les acteurs "trigger" (Pickup,
+    Flashlight, LightSwitch, Medikit, HidingSpot) ont volontairement NO_COLLISION sur
+    leur propre composant et sont, PAR DESIGN, censés être placés au contact d'un meuble
+    (lampe torche posée sur une table, cachette juste à côté d'un casier) — les faire
+    passer par le même sphere_overlap_actors que produisait N faux positifs "OVERLAP REEL"
+    sur ces meubles cibles. Diagnostiqué en session sur HorrorLevel : 6 des 9 erreurs
+    remontées par run_verify() étaient des HidingSpot/Pickup collés à leur meuble prévu,
+    pas de vrais bugs de placement.
     """
     errors = []
-    gameplay_keywords = ["Enemy", "PlayerStart", "Pickup", "Flashlight",
-                         "LightSwitch", "JumpScare", "Medikit", "HidingSpot"]
+    PHYSICAL_KEYWORDS = ["Enemy", "PlayerStart", "JumpScare"]
+    TRIGGER_KEYWORDS = ["Pickup", "Flashlight", "LightSwitch", "Medikit", "HidingSpot"]
+    gameplay_keywords = PHYSICAL_KEYWORDS + TRIGGER_KEYWORDS
 
     for a in actors:
         lbl = a.get_actor_label()
         if not any(k in lbl for k in gameplay_keywords):
             continue
         loc = a.get_actor_location()
+        is_trigger_only = (any(k in lbl for k in TRIGGER_KEYWORDS)
+                            and not any(k in lbl for k in PHYSICAL_KEYWORDS))
 
         # ── Couche 1 : overlap physique réel (sphere_overlap_actors) ─────────
         # UE5.7 : unreal.Array(ObjectTypeQuery) vide = tous les types (NE PAS passer [])
-        try:
-            obj_types = unreal.Array(unreal.ObjectTypeQuery)
-            ignore    = unreal.Array(unreal.Actor)
-            ignore.append(a)
-            overlaps  = unreal.SystemLibrary.sphere_overlap_actors(
-                world, loc, 40.0,
-                obj_types, unreal.Actor, ignore
-            )
-            geo_overlaps = [o for o in overlaps
-                            if "StaticMeshActor" in o.get_class().get_name()]
-            if geo_overlaps:
-                names = [o.get_actor_label() for o in geo_overlaps]
-                errors.append(
-                    f"OVERLAP REEL: {lbl} est en collision physique avec {names}"
+        # Sautée pour les acteurs trigger-only (voir docstring ci-dessus).
+        if not is_trigger_only:
+            try:
+                obj_types = unreal.Array(unreal.ObjectTypeQuery)
+                ignore    = unreal.Array(unreal.Actor)
+                ignore.append(a)
+                overlaps  = unreal.SystemLibrary.sphere_overlap_actors(
+                    world, loc, 40.0,
+                    obj_types, unreal.Actor, ignore
                 )
-        except Exception:
-            # Fallback AABB si sphere_overlap_actors indisponible
-            geo_boxes_filtered = [(gl, go, ge) for gl, go, ge in geo_boxes if gl != lbl]
-            inside = _bb_inside_any_geo(loc, geo_boxes_filtered)
-            if inside:
-                errors.append(f"DANS GEOMETRIE (AABB): {lbl} est à l'intérieur de {inside}")
+                geo_overlaps = [o for o in overlaps
+                                if "StaticMeshActor" in o.get_class().get_name()]
+                if geo_overlaps:
+                    names = [o.get_actor_label() for o in geo_overlaps]
+                    errors.append(
+                        f"OVERLAP REEL: {lbl} est en collision physique avec {names}"
+                    )
+            except Exception:
+                # Fallback AABB si sphere_overlap_actors indisponible
+                geo_boxes_filtered = [(gl, go, ge) for gl, go, ge in geo_boxes if gl != lbl]
+                inside = _bb_inside_any_geo(loc, geo_boxes_filtered)
+                if inside:
+                    errors.append(f"DANS GEOMETRIE (AABB): {lbl} est à l'intérieur de {inside}")
 
         # ── Couche 2 : sol sous les pieds ────────────────────────────────────
         has_floor, dist, floor_actor = _line_trace_down(world, loc.x, loc.y, loc.z)
@@ -356,9 +372,11 @@ def check_postprocess_atmosphere(actors):
     return errors
 
 
-def check_light_coverage(actors, geo_boxes, min_playable_pct=50.0, ideal_pct=60.0):
-    """Échantillonne une grille de points sur le sol et vérifie qu'un pourcentage
-    suffisant de la surface est réellement à portée d'au moins un point light actif.
+def check_light_coverage(actors, geo_boxes, min_playable_pct=50.0, ideal_pct=60.0,
+                          corridor_min_pct=15.0, corridor_ideal_pct=25.0):
+    """Échantillonne une grille de points sur le sol, PAR ZONE, et vérifie qu'un
+    pourcentage suffisant de la surface est réellement à portée d'au moins un point
+    light actif.
 
     Approximation 2D par distance (pas de line-of-sight/occlusion par les murs —
     heuristique volontairement simple). Objectif : détecter le cas "toutes les checks
@@ -366,11 +384,31 @@ def check_light_coverage(actors, geo_boxes, min_playable_pct=50.0, ideal_pct=60.
     2 point lights radius=500 dans une salle de 1600×1200, donc ~80% de la surface
     hors de portée de toute lumière, alors que run_verify() disait "JOUABLE").
 
-    Seuil : < 50% de couverture = ERREUR bloquante (le joueur ne voit littéralement
+    Corrigé le 2026-07-07 : la version précédente calculait UNE SEULE bounding box sur
+    tous les murs du level entier puis échantillonnait dessus. Sur un level multi-zones
+    (HorrorLevel : 9 zones + couloirs sur ~9600 UU), ça mélange des salles éclairées et
+    des couloirs volontairement sombres (voir HORROR_DESIGN.md / CLAUDE.md "couloir
+    sombre, mannequins décoratifs") dans une seule moyenne globale — un niveau où
+    chaque salle est correctement éclairée peut quand même se retrouver sous 50% de
+    couverture "globale" simplement parce que les couloirs, sombres par design,
+    tirent la moyenne vers le bas. Diagnostiqué en session sur HorrorLevel (9 zones) :
+    22% de couverture globale alors qu'aucune salle individuelle n'était réellement
+    sous-éclairée une fois recalculé zone par zone.
+
+    Les murs sont regroupés par préfixe de label avant "_Wall" (ex: "Z1_WallN",
+    "Z1_WallS" → zone "Z1"). Un groupe dont le nom contient "corr"/"couloir"
+    (insensible à la casse) est traité comme un couloir et reçoit un seuil bien plus
+    bas (corridor_min_pct/corridor_ideal_pct) — cohérent avec le fait qu'un couloir
+    sombre entre deux salles est une intention de design, pas un bug.
+
+    Seuil salle : < 50% de couverture = ERREUR bloquante (le joueur ne voit littéralement
     rien sur la majorité du sol, ce n'est plus "sombre et effrayant", c'est cassé).
     50-60% = warning (en dessous du ratio cible HORROR_DESIGN.md section 9 : "60%
-    visible, 40% dans l'ombre").
+    visible, 40% dans l'ombre"). Couloir : mêmes principes mais seuils abaissés
+    (15%/25% par défaut) puisque l'obscurité y est voulue.
     """
+    import re
+
     errors, warnings = [], []
 
     lights = []
@@ -386,40 +424,54 @@ def check_light_coverage(actors, geo_boxes, min_playable_pct=50.0, ideal_pct=60.
         errors.append("AUCUNE LUMIERE ACTIVE: 0 point light avec intensity>0 — la salle est nécessairement noire")
         return errors, warnings
 
-    wall_boxes = [(o, e) for lbl, o, e in geo_boxes if "wall" in lbl.lower() or "mur" in lbl.lower()]
+    wall_boxes = [(lbl, o, e) for lbl, o, e in geo_boxes if "wall" in lbl.lower() or "mur" in lbl.lower()]
     if not wall_boxes:
         warnings.append("COUVERTURE LUMIERE: aucun mur identifiable (label contenant 'wall') — check ignoré")
         return errors, warnings
 
-    xs = [o.x for o, e in wall_boxes] + [o.x + e.x for o, e in wall_boxes] + [o.x - e.x for o, e in wall_boxes]
-    ys = [o.y for o, e in wall_boxes] + [o.y + e.y for o, e in wall_boxes] + [o.y - e.y for o, e in wall_boxes]
-    x_min, x_max = min(xs), max(xs)
-    y_min, y_max = min(ys), max(ys)
-    floor_z = min((o.z for o, e in wall_boxes), default=100.0) - 100.0  # approx niveau du sol
+    # Regroupement par zone : préfixe avant "_Wall" (insensible à la casse).
+    # Fallback : le label complet sert de clé si le motif "_Wall" n'est pas trouvé.
+    zones = {}
+    for lbl, o, e in wall_boxes:
+        m = re.match(r"(.+?)_wall", lbl, re.IGNORECASE)
+        zone_key = m.group(1) if m else lbl
+        zones.setdefault(zone_key, []).append((o, e))
 
-    GRID = 12  # 12x12 = 144 échantillons, suffisant pour une salle standard
-    total, covered = 0, 0
-    for i in range(GRID):
-        for j in range(GRID):
-            px = x_min + (x_max - x_min) * (i + 0.5) / GRID
-            py = y_min + (y_max - y_min) * (j + 0.5) / GRID
-            total += 1
-            for loc, radius in lights:
-                dx, dy, dz = px - loc.x, py - loc.y, floor_z - loc.z
-                if (dx*dx + dy*dy + dz*dz) ** 0.5 <= radius:
-                    covered += 1
-                    break
+    GRID = 8  # par zone (plus petite qu'un level entier) — 8x8 = 64 échantillons suffisent
+    for zone_key, boxes in zones.items():
+        xs = [o.x for o, e in boxes] + [o.x + e.x for o, e in boxes] + [o.x - e.x for o, e in boxes]
+        ys = [o.y for o, e in boxes] + [o.y + e.y for o, e in boxes] + [o.y - e.y for o, e in boxes]
+        x_min, x_max = min(xs), max(xs)
+        y_min, y_max = min(ys), max(ys)
+        floor_z = min((o.z for o, e in boxes), default=100.0) - 100.0  # approx niveau du sol
 
-    pct = (covered / total * 100.0) if total else 0.0
-    if pct < min_playable_pct:
-        errors.append(
-            f"SALLE TROP SOMBRE: seulement {pct:.0f}% du sol est à portée d'une lumière "
-            f"(seuil jouable: {min_playable_pct:.0f}%) — ajouter des point lights ou augmenter leur radius"
-        )
-    elif pct < ideal_pct:
-        warnings.append(
-            f"ECLAIRAGE LIMITE: {pct:.0f}% du sol couvert (cible HORROR_DESIGN.md: ~{ideal_pct:.0f}%)"
-        )
+        total, covered = 0, 0
+        for i in range(GRID):
+            for j in range(GRID):
+                px = x_min + (x_max - x_min) * (i + 0.5) / GRID
+                py = y_min + (y_max - y_min) * (j + 0.5) / GRID
+                total += 1
+                for loc, radius in lights:
+                    dx, dy, dz = px - loc.x, py - loc.y, floor_z - loc.z
+                    if (dx*dx + dy*dy + dz*dz) ** 0.5 <= radius:
+                        covered += 1
+                        break
+
+        pct = (covered / total * 100.0) if total else 0.0
+        is_corridor = bool(re.search(r"corr|couloir", zone_key, re.IGNORECASE))
+        threshold = corridor_min_pct if is_corridor else min_playable_pct
+        ideal = corridor_ideal_pct if is_corridor else ideal_pct
+        kind = "couloir" if is_corridor else "jouable"
+
+        if pct < threshold:
+            errors.append(
+                f"SALLE TROP SOMBRE [{zone_key}]: seulement {pct:.0f}% du sol est à portée d'une lumière "
+                f"(seuil {kind}: {threshold:.0f}%) — ajouter des point lights ou augmenter leur radius"
+            )
+        elif pct < ideal:
+            warnings.append(
+                f"ECLAIRAGE LIMITE [{zone_key}]: {pct:.0f}% du sol couvert (cible: ~{ideal:.0f}%)"
+            )
     return errors, warnings
 
 
@@ -646,87 +698,4 @@ def fix_enemy_tags():
                 a.tags = list(a.tags) + [unreal.Name("Enemy")]
                 print(f"  Fixed: {a.get_actor_label()} — tag 'Enemy' ajouté")
                 fixed += 1
-    print(f"fix_enemy_tags: {fixed} ennemi(s) corrigé(s)")
-    return fixed
-
-
-def fix_duplicate_postprocess():
-    """Supprime les PostProcessVolume en double, garde le premier."""
-    actors = _actors()
-    aeas = _aeas()
-    pp_actors = [a for a in actors if "PostProcess" in a.get_actor_label()]
-    removed = 0
-    for a in pp_actors[1:]:
-        aeas.destroy_actor(a)
-        removed += 1
-    print(f"fix_duplicate_postprocess: {removed} doublon(s) supprimé(s)")
-    return removed
-
-
-def fix_default_materials():
-    """Remplace les matériaux par défaut (BasicShapeMaterial, MI_ProcGrid...) restants
-    sur tout StaticMeshActor dont le label contient wall/floor/ceil — indépendamment
-    du préfixe de zone (filet de sécurité générique, complète _apply_room_materials
-    de horror_presets.py qui exige un préfixe exact).
-    """
-    mat_w = unreal.load_asset(MAT_WALL)
-    mat_f = unreal.load_asset(MAT_FLOOR)
-    mat_c = unreal.load_asset(MAT_CEIL)
-    fixed = 0
-    for a in _actors():
-        if "StaticMeshActor" not in a.get_class().get_name():
-            continue
-        label = a.get_actor_label() or ""
-        ll = label.lower()
-        smc = a.get_component_by_class(unreal.StaticMeshComponent.static_class())
-        if not smc:
-            continue
-        mat = smc.get_material(0)
-        mat_name = mat.get_name().lower() if mat else "none"
-        if mat is not None and not any(bad in mat_name for bad in BAD_MATERIAL_KEYWORDS):
-            continue  # déjà un matériau custom, ne pas écraser un choix volontaire
-        if "wall" in ll or "mur" in ll:
-            if mat_w: smc.set_material(0, mat_w); fixed += 1
-        elif "floor" in ll or "sol" in ll:
-            if mat_f: smc.set_material(0, mat_f); fixed += 1
-        elif "ceil" in ll or "plafond" in ll:
-            if mat_c: smc.set_material(0, mat_c); fixed += 1
-    print(f"fix_default_materials: {fixed} surface(s) corrigée(s)")
-    return fixed
-
-
-def fix_global_lights():
-    """Éteint SkyLight/DirectionalLight à leur valeur par défaut (workflow CLAUDE.md
-    étape 1 : 'Éteindre lumières globales'). N'y touche pas si déjà à 0."""
-    fixed = 0
-    for a in _actors():
-        cls = a.get_class().get_name()
-        if "SkyLight" in cls:
-            c = a.get_component_by_class(unreal.SkyLightComponent.static_class())
-            if c and c.get_editor_property("intensity") > 0.5:
-                c.set_editor_property("intensity", 0.0)
-                fixed += 1
-        elif "DirectionalLight" in cls:
-            c = a.get_component_by_class(unreal.DirectionalLightComponent.static_class())
-            if c and c.get_editor_property("intensity") > 0.5:
-                c.set_editor_property("intensity", 0.0)
-                fixed += 1
-    print(f"fix_global_lights: {fixed} lumière(s) globale(s) éteinte(s)")
-    return fixed
-
-
-def fix_all():
-    """Applique tous les correctifs automatiques disponibles."""
-    print("=== FIX ALL ===")
-    fix_light_radius()
-    fix_enemy_tags()
-    fix_duplicate_postprocess()
-    fix_default_materials()
-    fix_global_lights()
-    print("fix_all terminé — relancer run_verify() pour confirmer")
-    print("NOTE: fix_all ne peut PAS créer un PostProcessVolume manquant ni désactiver")
-    print("      Lumen à ta place — si run_verify() signale POSTPROCESS ABSENT ou")
-    print("      LUMEN ACTIF, utiliser setup_global_atmosphere(style) de horror_presets.py")
-
-
-print("[verify_level] loaded — from verify_level import run_verify, fix_all")
+    print(f"fix_enemy_tags: {fixed} ennemi(s)
