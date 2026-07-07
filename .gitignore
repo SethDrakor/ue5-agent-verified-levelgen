@@ -1,0 +1,24 @@
+# Generated / build artifacts (not applicable to this extracted showcase,
+# kept in case the plugin is dropped back into a live UE5 project)
+Binaries/
+Intermediate/
+Build/
+*.pdb
+*.obj
+
+# Debug artifacts from working sessions (not code, not useful here)
+*.t3d
+*_result.txt
+debug.txt
+diag.txt
+
+# OS/editor cruft
+.DS_Store
+Thumbs.db
+.vs/
+*.sln
+*.suo
+
+# Python
+__pycache__/
+*.pyc
