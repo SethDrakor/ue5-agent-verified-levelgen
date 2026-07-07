@@ -56,6 +56,25 @@ anything that touches the C++ subsystems or Blueprint graphs. CI here is a
 second, narrower net underneath it — for the class of bug that doesn't need
 an editor to catch, and that nothing was catching before.
 
+## Running these checks before you even commit
+
+Both bugs below were caught by CI — which means they were already pushed
+to `master` by the time anything noticed. `scripts/hooks/pre-commit` runs
+the same two structural checks (`check_repo_integrity.py`,
+`check_doc_references.py`) as a git pre-commit hook, so a corrupted file
+gets caught locally, before it's committed at all — not just before it's
+merged.
+
+One-time setup after cloning:
+
+```
+git config core.hooksPath scripts/hooks
+```
+
+After that, `git commit` runs the checks automatically and refuses to
+commit if either one fails (`git commit --no-verify` bypasses it, and
+shouldn't be needed — if you're reaching for it, fix the file instead).
+
 ## Why this exists: two bugs found while building it
 
 **A silently truncated toolchain sync.** While writing the import-smoke

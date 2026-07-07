@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# Local pre-commit guard for this repo.
+#
+# Runs the same structural checks CI runs (scripts/check_repo_integrity.py,
+# scripts/check_doc_references.py) BEFORE a commit is allowed to happen, not
+# just after it's already pushed. This exists because both bugs documented
+# in docs/CI.md were only caught by writing the CI checks after the fact —
+# a local hook is a second, earlier point where the same corruption gets
+# caught, ideally before it's on disk in a commit at all.
+#
+# Setup (one-time, per clone):
+#   git config core.hooksPath scripts/hooks
+#
+# To intentionally skip this (should be rare — fix the problem instead):
+#   git commit --no-verify
+
+set -euo pipefail
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "$REPO_ROOT"
+
+FAILED=0
+
+echo "[pre-commit] Checking repo integrity..."
+if ! python3 scripts/check_repo_integrity.py; then
+    FAILED=1
+fi
+
+echo "[pre-commit] Checking doc references..."
+if ! python3 scripts/check_doc_references.py; then
+    FAILED=1
+fi
+
+if [ "$FAILED" -ne 0 ]; then
+    echo ""
+    echo "[pre-commit] BLOCKED — fix the problem(s) above before committing."
+    echo "[pre-commit] (or 'git commit --no-verify' to bypass, not recommended)"
+    exit 1
+fi
+
+echo "[pre-commit] OK"
+exit 0
