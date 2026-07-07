@@ -1652,7 +1652,7 @@ def setup_horror_corridor_full(x1, x2, cy=0, width=500,
 # un à la main. L'IDÉE N'EST PAS de faire du NLP en Python dans UE5 (pas d'accès LLM
 # depuis ue5_execute) : c'est Claude Cowork qui lit la demande en langage naturel de
 # l'utilisateur et la traduit en plan JSON structuré (graphe de salles + pacing) en
-# s'appuyant sur LEVEL_DESIGN_THEORY.md / GAME_DESIGN_THEORY.md / HORROR_DESIGN.md.
+# s'appuyant sur DESIGN_THEORY.md / HORROR_DESIGN.md.
 # execute_level_plan() est seulement l'EXÉCUTEUR de ce plan une fois produit — le
 # placement séquentiel le long de l'axe X, le chaînage salle->couloir->salle, et
 # l'application de fix_all()/run_verify() à la fin sont automatiques.

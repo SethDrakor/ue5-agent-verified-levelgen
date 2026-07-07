@@ -88,3 +88,43 @@ floor height.
 NavMesh** after a geometry change — only the in-editor `Build > Build Paths`
 action does. There's no scripted equivalent used here; it's called out
 explicitly in the workflow as a manual step.
+
+**A physics-overlap check applied uniformly to all "gameplay" actors produces
+false positives on actors that are supposed to touch furniture.** A pickup
+resting on a table, or a hiding spot flush against its own locker, will
+correctly overlap that mesh — that's the intended placement, not a bug. An
+early version of the placement checker ran the same `sphere_overlap_actors`
+test on every gameplay-tagged actor regardless of type, so ~2/3 of the
+"physical overlap" errors it reported on a real level were these intentional
+contacts. Fix: split gameplay actors into two categories — actors with real
+physical presence (enemies, the player start, jumpscare triggers) still get
+the overlap check; actors that are deliberately placed in contact with static
+props (pickups, light switches, hiding spots) skip it and rely on the
+floor-trace check alone.
+
+**Averaging every wall's position to auto-aim a verification screenshot
+breaks down on multi-room levels.** A "take one screenshot from the average
+position of all geometry" heuristic works when there's one room (the average
+*is* the room center) but not on a level with several rooms strung along a
+corridor — the average can land inside a wall, or in the corridor between two
+lit rooms, producing a screenshot that's almost entirely black despite the
+level being correctly lit. The fix that generalizes: group walls by a zone
+label first, screenshot (or measure light coverage) per zone, not once for
+the whole level. Even then, watch for degenerate groups — two adjacent rooms
+sharing a long wall (with only a short end-cap wall carrying the "owning"
+room's own label prefix) will otherwise produce a phantom zone whose
+"bounding box" is a sliver along that one wall, with a center point sitting
+on the wall itself rather than in the room. Detected by requiring at least 2
+walls per zone group (a single wall can't bound a room) and merging any
+group that fails that test into its nearest neighbor by position.
+
+**No single fixed camera angle reliably frames an open-plan room** (one with
+partition walls on only one axis, common in a level with no doors between
+sections — a "room" here is really just a wider stretch of one long
+corridor). Looking down the open axis can either show the room's own
+lighting and props, or tunnel straight through to whatever is lit several
+rooms away, depending on where exactly the far light happens to sit — and
+there's no way to tell which outcome a given room will produce without
+already knowing what's in it. Rather than guess, the toolchain captures both
+the along-corridor and across-corridor angles for these rooms and leaves the
+choice of which is representative to whoever is reviewing the screenshots.

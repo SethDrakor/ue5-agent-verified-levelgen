@@ -99,6 +99,23 @@ Active solo project. The RoomGenerator plugin and the Python toolchain are
 generic — reusable on any UE5 project that needs agent-driven level
 generation or Blueprint editing.
 
+## Proof, not just claims
+
+`run_verify()` on the actual project level — 11 automated checks, screenshot
+included, before a single `save()` is allowed to happen. See `media/Run_Verify.png`
+and `media/TEST SUITE — HorrorGame Plugin.png` for the anti-regression suite
+catching a real, deliberately-triggered regression and then passing clean.
+
+See `docs/ARCHITECTURE.md` for a deeper technical breakdown and
+`docs/KNOWN_ISSUES.md` for the undocumented UE5.7 bugs found and fixed along
+the way.ppen:
+
+![run_verify() passing](media/run_verify_passing.png)
+
+The anti-regression suite for the plugin and Python toolchain, 45/45:
+
+![test_suite 45/45](media/test_suite_45_45.png)
+
 ---
 
 *See `docs/ARCHITECTURE.md` for a deeper technical breakdown and

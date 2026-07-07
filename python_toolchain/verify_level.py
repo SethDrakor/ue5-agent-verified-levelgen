@@ -372,6 +372,59 @@ def check_postprocess_atmosphere(actors):
     return errors
 
 
+def _group_walls_by_zone(wall_boxes, min_span=300.0):
+    """Regroupe des wall boxes par zone (préfixe avant "_Wall"), en fusionnant les
+    groupes dégénérés dans leur voisin le plus proche.
+
+    Bug diagnostiqué le 2026-07-07 (juste après le fix "per-zone" du même jour) : sur
+    HorrorLevel, Zone 1 et Zone 2 partagent les mêmes murs N/S continus, labellisés
+    "Z2_WallN"/"Z2_WallS" (extent.x=1938, couvre les DEUX zones) — seul le mur de bout
+    "Z1_WallW" porte le préfixe "Z1_". Un regroupement naïf par préfixe crée donc un
+    groupe fantôme "Z1" avec UNE SEULE box fine (20×1200 UU, quasi une ligne), dont le
+    centre calculé (0,0) tombe exactement sur le mur de bout — pas dans la pièce. Un
+    screenshot pris à ce centre est collé au mur (noir total) et le % de couverture
+    lumière calculé sur cette bounding box dégénérée ne mesure presque rien de la vraie
+    pièce. Confirmé : `Z1_Floor` n'existe même pas, la pièce partage `Z2_Floor`.
+
+    Fix : tout groupe dont l'étendue X ET Y est sous `min_span` (une simple ligne, pas
+    une vraie salle) est fusionné dans le groupe "sain" le plus proche en X plutôt que
+    traité comme une zone à part — cohérent avec la réalité géométrique (mur de bout
+    d'un espace ouvert partagé, pas une pièce indépendante).
+    """
+    import re
+    raw = {}
+    for lbl, o, e in wall_boxes:
+        m = re.match(r"(.+?)_wall", lbl, re.IGNORECASE)
+        zone_key = m.group(1) if m else lbl
+        raw.setdefault(zone_key, []).append((lbl, o, e))
+
+    def _span_and_center(items):
+        xs = [o.x for _, o, e in items] + [o.x + e.x for _, o, e in items] + [o.x - e.x for _, o, e in items]
+        ys = [o.y for _, o, e in items] + [o.y + e.y for _, o, e in items] + [o.y - e.y for _, o, e in items]
+        return (max(xs) - min(xs), max(ys) - min(ys), sum(xs) / len(xs))
+
+    good, degenerate = {}, {}
+    for zk, items in raw.items():
+        sx, sy, cx = _span_and_center(items)
+        # Dégénéré si : moins de 2 murs (un seul mur de bout ne définit aucune vraie
+        # étendue de salle — il aura toujours un grand span dans SA propre longueur,
+        # ce qui ne dit rien de l'étendue réelle de la pièce sur cet axe), OU span nul
+        # sur les deux axes (cas limite, tous les murs au même endroit).
+        if len(items) < 2 or (sx < min_span and sy < min_span):
+            degenerate[zk] = (items, cx)
+        else:
+            good[zk] = items
+
+    for zk, (items, cx) in degenerate.items():
+        if not good:
+            good[zk] = items
+            continue
+        nearest = min(good.keys(), key=lambda gk: abs(_span_and_center(good[gk])[2] - cx))
+        good[nearest] = good[nearest] + items
+
+    return good
+
+
 def check_light_coverage(actors, geo_boxes, min_playable_pct=50.0, ideal_pct=60.0,
                           corridor_min_pct=15.0, corridor_ideal_pct=25.0):
     """Échantillonne une grille de points sur le sol, PAR ZONE, et vérifie qu'un
@@ -429,13 +482,11 @@ def check_light_coverage(actors, geo_boxes, min_playable_pct=50.0, ideal_pct=60.
         warnings.append("COUVERTURE LUMIERE: aucun mur identifiable (label contenant 'wall') — check ignoré")
         return errors, warnings
 
-    # Regroupement par zone : préfixe avant "_Wall" (insensible à la casse).
-    # Fallback : le label complet sert de clé si le motif "_Wall" n'est pas trouvé.
-    zones = {}
-    for lbl, o, e in wall_boxes:
-        m = re.match(r"(.+?)_wall", lbl, re.IGNORECASE)
-        zone_key = m.group(1) if m else lbl
-        zones.setdefault(zone_key, []).append((o, e))
+    # Regroupement par zone : préfixe avant "_Wall" (insensible à la casse), avec
+    # fusion des groupes dégénérés (mur de bout d'un espace partagé) — voir
+    # _group_walls_by_zone() pour le détail du bug corrigé le 2026-07-07.
+    zones_raw = _group_walls_by_zone(wall_boxes)
+    zones = {zk: [(o, e) for _, o, e in items] for zk, items in zones_raw.items()}
 
     GRID = 8  # par zone (plus petite qu'un level entier) — 8x8 = 64 échantillons suffisent
     for zone_key, boxes in zones.items():
@@ -542,160 +593,55 @@ def take_verify_screenshot(name="verify", capture_pos=None):
     return capture_reference_screenshot(x, y, z, pitch=pitch, yaw=yaw, roll=roll, name=name)
 
 
-# ──────────────────────────────────────────────
-# Entrée principale
-# ──────────────────────────────────────────────
+def capture_all_zones_screenshots(name_prefix="verify_zone"):
+    """Un screenshot PAR ZONE plutôt qu'un point moyen sur tout le level.
 
-def run_verify(take_screenshot=True, level_name=None):
-    """Vérifie le level courant et retourne True si jouable.
+    Bug diagnostiqué le 2026-07-07 sur HorrorLevel : take_verify_screenshot() sans
+    capture_pos explicite prend la moyenne des origins de TOUTE la géométrie du level
+    comme position de caméra. Sur un level à une seule salle (AgentDemo, sa cible
+    d'origine) cette moyenne tombe au centre de la salle — correct. Sur un level
+    multi-zones (HorrorLevel : 9 zones/couloirs sur ~10000 UU en X), la moyenne tombe
+    n'importe où — ici en plein dans le couloir vers Zone 3 — et le screenshot résultant
+    est presque entièrement noir (caméra collée à un mur, vue en tunnel à travers une
+    ouverture lointaine). run_verify() annonçait pourtant "0 erreur, JOUABLE" : le texte
+    du rapport était correct, mais le seul artefact visuel produit ne permettait de
+    juger aucune zone réelle — la boucle vision n'était fermée qu'en apparence.
 
-    Affiche un rapport complet avec erreurs bloquantes et warnings.
+    Réutilise le même regroupement par zone que check_light_coverage() (préfixe avant
+    "_Wall", couloirs détectés par "corr"/"couloir") pour que screenshot et check de
+    couverture lumière portent exactement sur les mêmes zones. Un point de vue par
+    zone (centre XY, z=170 hauteur des yeux, pitch=0, yaw=180 — convention du projet,
+    voir CLAUDE.md "Screenshot fiable") permet de juger visuellement chaque salle
+    individuellement au lieu d'un seul point arbitraire sur tout le level.
+
+    Retourne {zone_key: chemin_png}.
     """
-    world = _world()
+    import re
+    from ue5_utils import capture_reference_screenshot
+
     actors = _actors()
     geo_boxes = _get_geo_boxes(actors)
+    wall_boxes = [(lbl, o, e) for lbl, o, e in geo_boxes if "wall" in lbl.lower() or "mur" in lbl.lower()]
 
-    name_str = level_name or world.get_name()
-    print(f"\n{'='*50}")
-    print(f"VERIFY LEVEL — {name_str} ({len(actors)} acteurs)")
-    print(f"{'='*50}")
+    zones_raw = _group_walls_by_zone(wall_boxes)
+    zones = {zk: [(o, e) for _, o, e in items] for zk, items in zones_raw.items()}
 
-    all_errors = []
-    all_warnings = []
+    paths = {}
+    for zone_key, boxes in zones_raw.items():
+        xs = [o.x for _, o, e in boxes]
+        ys = [o.y for _, o, e in boxes]
+        cx = sum(xs) / len(xs)
+        cy = sum(ys) / len(ys)
 
-    # Screenshot en premier (montre l'état avant les checks)
-    screenshot_path = None
-    if take_screenshot:
-        print("\n[1/11] Screenshot viewport...")
-        screenshot_path = take_verify_screenshot(f"verify_{name_str}")
-        if screenshot_path:
-            print(f"      Screenshot: {screenshot_path}")
-        else:
-            all_warnings.append("Screenshot non trouvé (UE5 pas en focus ?)")
-
-    # Checks
-    print("\n[2/11] Positions acteurs (dans géométrie / sol manquant)...")
-    errs = check_actor_positions(actors, world, geo_boxes)
-    all_errors.extend(errs)
-    print(f"      {len(errs)} erreur(s)")
-
-    print("\n[3/11] Tags ennemis...")
-    errs = check_enemy_tags(actors)
-    all_errors.extend(errs)
-    print(f"      {len(errs)} erreur(s)")
-
-    print("\n[4/11] Lumières (radius configuré)...")
-    warns = check_lights(actors)
-    all_warnings.extend(warns)
-    print(f"      {len(warns)} warning(s)")
-
-    print("\n[5/11] Gameplay completeness...")
-    errs = check_gameplay_completeness(actors)
-    all_errors.extend(errs)
-    print(f"      {len(errs)} erreur(s)")
-
-    print("\n[6/11] Doublons...")
-    warns = check_duplicates(actors)
-    all_warnings.extend(warns)
-    print(f"      {len(warns)} warning(s)")
-
-    print("\n[7/11] NavMesh builté...")
-    warns = check_navmesh_rebuild(world)
-    all_warnings.extend(warns)
-    print(f"      {len(warns)} warning(s)")
-
-    print("\n[8/11] Matériaux (défauts restants sur murs/sol/plafond)...")
-    errs = check_materials(actors)
-    all_errors.extend(errs)
-    print(f"      {len(errs)} erreur(s)")
-
-    print("\n[9/11] PostProcess (présence + Lumen désactivé)...")
-    errs = check_postprocess_atmosphere(actors)
-    all_errors.extend(errs)
-    print(f"      {len(errs)} erreur(s)")
-
-    print("\n[10/11] Lumières globales par défaut (SkyLight/DirectionalLight)...")
-    errs = check_default_level_lighting(actors)
-    all_errors.extend(errs)
-    print(f"      {len(errs)} erreur(s)")
-
-    print("\n[11/11] Couverture lumière (le sol est-il vraiment visible ?)...")
-    errs, warns = check_light_coverage(actors, geo_boxes)
-    all_errors.extend(errs)
-    all_warnings.extend(warns)
-    print(f"      {len(errs)} erreur(s), {len(warns)} warning(s)")
-
-    # Rapport final
-    print(f"\n{'='*50}")
-    print(f"RAPPORT FINAL")
-    print(f"{'='*50}")
-
-    if all_errors:
-        print(f"\n❌ ERREURS BLOQUANTES ({len(all_errors)}) — level NON jouable :")
-        for e in all_errors:
-            print(f"   • {e}")
-    else:
-        print(f"\n✅ Aucune erreur bloquante")
-
-    if all_warnings:
-        print(f"\n⚠  WARNINGS ({len(all_warnings)}) — level jouable mais imparfait :")
-        for w in all_warnings:
-            print(f"   • {w}")
-    else:
-        print(f"\n✅ Aucun warning")
-
-    if not all_errors and not all_warnings:
-        print(f"\n🎮 LEVEL PARFAITEMENT JOUABLE")
-
-    if screenshot_path:
-        print(f"\n📸 Screenshot: {screenshot_path}")
-        print(f"   (lire avec Read tool pour vérification visuelle)")
-
-    playable = len(all_errors) == 0
-    print(f"\n{'='*50}")
-    print(f"VERDICT: {'JOUABLE ✅' if playable else 'NON JOUABLE ❌'}")
-    print(f"{'='*50}\n")
-    return playable
-
-
-# ──────────────────────────────────────────────
-# Fix automatique des problèmes détectés
-# ──────────────────────────────────────────────
-
-def fix_light_radius(target_radius_map=None):
-    """Corrige les radius de toutes les lumières avec radius=1000 (valeur par défaut).
-
-    target_radius_map : dict {label: radius} pour des valeurs précises.
-    Sans map, applique 400 par défaut à toutes les lumières non configurées.
-
-    Exemple:
-        fix_light_radius({"Z1_Entry_Amber": 320, "Corr_Red": 500})
-    """
-    actors = _actors()
-    fixed = 0
-    for a in actors:
-        if "PointLight" in a.get_class().get_name():
-            lbl = a.get_actor_label()
-            lc = a.point_light_component
-            current = int(lc.get_editor_property("attenuation_radius"))
-            if current >= 1000:
-                target = (target_radius_map or {}).get(lbl, 400)
-                lc.set_editor_property("attenuation_radius", float(target))
-                print(f"  Fixed: {lbl} radius {current} → {target}")
-                fixed += 1
-    print(f"fix_light_radius: {fixed} lumière(s) corrigée(s)")
-    return fixed
-
-
-def fix_enemy_tags():
-    """Ajoute le tag 'Enemy' à tous les BP_IA_Enemy qui ne l'ont pas."""
-    actors = _actors()
-    fixed = 0
-    for a in actors:
-        if "BP_IA_Enemy" in a.get_class().get_name():
-            tags = [str(t) for t in a.tags]
-            if "Enemy" not in tags:
-                a.tags = list(a.tags) + [unreal.Name("Enemy")]
-                print(f"  Fixed: {a.get_actor_label()} — tag 'Enemy' ajouté")
-                fixed += 1
-    print(f"fix_enemy_tags: {fixed} ennemi(s)
+        # yaw=180 (regarder vers -X) suppose une salle fermée avec un mur de bout à
+        # l'ouest — correct pour les zones avec des murs Est/Ouest (ou L/R pour un
+        # couloir, où "descendre le couloir" est la vue naturelle). Mais Z3A/Z3B/Z3C
+        # (voir GAME_MEMORY.md layout) n'ont QUE des murs N/S — pas de mur de bout en
+        # X — elles sont ouvertes sur le reste du niveau dans cet axe. Un yaw=180 y
+        # regarde alors à l'infini dans le couloir de jeu entier (vue tunnel jusqu'à
+        # la zone la plus proche encore éclairée), pas la salle elle-même. Pour ces
+        # zones "salle ouverte" (nom ne contenant pas corr/couloir ET aucun mur
+        # E/W/L/R), on tourne la caméra à 90° pour regarder à travers la largeur
+        # contrainte (N à S) à la place — cadrage représentatif de LA zone, pas du
+        # niveau entier vu au travers.
+        has_cap_wall = any(re.search(r"wall(
