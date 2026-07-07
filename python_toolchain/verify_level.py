@@ -295,35 +295,78 @@ MAT_CEIL  = "/Game/AssetImported/A_Surface_Footstep/Environment_Assets/Materials
 
 
 def check_materials(actors):
-    """Vérifie qu'aucun mur/sol/plafond de géométrie n'a gardé un matériau par défaut.
+    """Vérifie qu'aucun StaticMeshActor de géométrie n'a gardé un matériau par défaut.
 
-    Ne se base PAS sur un préfixe de zone (contrairement à _apply_room_materials côté
-    horror_presets.py) — scanne TOUT StaticMeshActor dont le label contient wall/floor/
-    ceil, quel que soit le système qui a généré la salle. C'est volontaire : une salle
-    avec des labels non standard (ex: "Wall_North" sans préfixe) doit quand même être
-    détectée si elle a un matériau par défaut.
+    Corrigé le 2026-07-07 (audit BoucherieLevel, fermeture de la boucle vision) : la
+    version précédente ne scannait QUE les labels contenant wall/floor/ceil/mur/sol/
+    plafond — 22 surfaces réelles sur BoucherieLevel (murs "Funnel_N", segments abrégés
+    "WN_L"/"WS_L"/"WE_S", murs de fond de niche "*_End", générés par un script ad hoc de
+    la session 8 jamais retrouvé dans Content/Python) étaient encore sur WorldGridMaterial
+    et ne matchaient AUCUN de ces mots-clés — jamais détectées, alors que run_verify()
+    répondait "0 erreur" sur les matériaux. Fix : ne plus filtrer par label du tout.
+    BAD_MATERIAL_KEYWORDS est déjà un signal suffisamment spécifique en soi (un asset
+    importé n'a jamais WorldGridMaterial/BasicShapeMaterial — seule une primitive
+    oubliée par un script générateur les porte) : scanner TOUT StaticMeshActor élimine
+    ce point aveugle définitivement, quel que soit le nom donné par un futur script.
+
+    Retourne (errors, warnings) — pas juste une liste. Deuxième bug trouvé en retirant
+    le filtre de label ci-dessus : sur HorrorLevel, ça a fait remonter Table_Z2 et
+    Cover_1..8 (props de gameplay, pas des murs/sol/plafond) au même niveau BLOQUANT
+    qu'une vraie surface structurelle — un cover au damier gris est moche mais ne casse
+    pas l'ambiance de toute la pièce comme un mur non habillé. Sévérité maintenant basée
+    sur _classify_surface_by_geometry() (même heuristique de forme que fix_default_
+    materials()) : structurel (mur/sol/plafond, par label OU par forme) → erreur
+    bloquante ; prop compact (table, cover...) → warning seulement.
     """
-    errors = []
+    errors, warnings = [], []
     for a in actors:
         if "StaticMeshActor" not in a.get_class().get_name():
             continue
         label = a.get_actor_label() or ""
         ll = label.lower()
-        is_room_surface = any(k in ll for k in
-            ["wall", "floor", "sol", "ceil", "plafond", "mur"])
-        if not is_room_surface:
-            continue
         smc = a.get_component_by_class(unreal.StaticMeshComponent.static_class())
         if not smc:
             continue
         mat = smc.get_material(0)
         mat_name = mat.get_name().lower() if mat else "none"
         if mat is None or any(bad in mat_name for bad in BAD_MATERIAL_KEYWORDS):
-            errors.append(
-                f"MATERIAU PAR DEFAUT: {label} a le matériau '{mat_name}' — "
-                f"l'étape d'application des matériaux horror n'a pas eu lieu ou a échoué"
-            )
-    return errors
+            is_structural = any(k in ll for k in ["wall", "floor", "sol", "ceil", "plafond", "mur"])
+            if not is_structural:
+                origin, extent = a.get_actor_bounds(False)
+                is_structural = _classify_surface_by_geometry(a.get_actor_location(), extent) is not None
+            msg = (f"MATERIAU PAR DEFAUT: {label} a le matériau '{mat_name}' — "
+                   f"l'étape d'application des matériaux horror n'a pas eu lieu ou a échoué")
+            if is_structural:
+                errors.append(msg)
+            else:
+                warnings.append(msg + " (prop non structurel — cosmétique, pas bloquant)")
+    return errors, warnings
+
+
+def _classify_surface_by_geometry(location, extent, floor_ceiling_split_z=150.0):
+    """Devine si une bounding box représente un mur, un sol ou un plafond à partir de sa
+    FORME plutôt que de son label — filet de secours pour les labels non standards
+    ("Funnel_N", segments abrégés "WN_L"/"WS_L"/"WE_S", murs de fond de niche "*_End"...)
+    qui ne contiennent aucun des mots-clés habituels. Complète _group_walls_by_zone() /
+    check_materials() sur le même bug de fond : un nom de label n'est jamais une garantie,
+    la géométrie réelle l'est.
+
+    extent.z nettement plus petit que extent.x ET extent.y → surface horizontale (sol si
+    location.z sous floor_ceiling_split_z, plafond sinon — 150 UU = moitié de la hauteur
+    de salle standard du projet, cohérent avec sol≈-20/0 et plafond≈300 partout ailleurs).
+    extent.x OU extent.y nettement plus petit que les deux autres → mur (l'orientation
+    N/S/E/W n'a pas besoin d'être déterminée, un seul MAT_WALL est utilisé de toute façon).
+    Retourne None si la forme n'est pas assez plate/allongée (ratio > 0.35) pour être une
+    surface structurelle — évite de classer à tort un prop compact (meuble, caisse...).
+    """
+    e = [extent.x, extent.y, extent.z]
+    thin, thick = min(e), max(e)
+    if thick <= 0 or thin / thick > 0.35:
+        return None
+    thin_axis = e.index(thin)
+    if thin_axis == 2:
+        return "floor" if location.z < floor_ceiling_split_z else "ceiling"
+    return "wall"
 
 
 def check_postprocess_atmosphere(actors):
@@ -593,55 +636,4 @@ def take_verify_screenshot(name="verify", capture_pos=None):
     return capture_reference_screenshot(x, y, z, pitch=pitch, yaw=yaw, roll=roll, name=name)
 
 
-def capture_all_zones_screenshots(name_prefix="verify_zone"):
-    """Un screenshot PAR ZONE plutôt qu'un point moyen sur tout le level.
-
-    Bug diagnostiqué le 2026-07-07 sur HorrorLevel : take_verify_screenshot() sans
-    capture_pos explicite prend la moyenne des origins de TOUTE la géométrie du level
-    comme position de caméra. Sur un level à une seule salle (AgentDemo, sa cible
-    d'origine) cette moyenne tombe au centre de la salle — correct. Sur un level
-    multi-zones (HorrorLevel : 9 zones/couloirs sur ~10000 UU en X), la moyenne tombe
-    n'importe où — ici en plein dans le couloir vers Zone 3 — et le screenshot résultant
-    est presque entièrement noir (caméra collée à un mur, vue en tunnel à travers une
-    ouverture lointaine). run_verify() annonçait pourtant "0 erreur, JOUABLE" : le texte
-    du rapport était correct, mais le seul artefact visuel produit ne permettait de
-    juger aucune zone réelle — la boucle vision n'était fermée qu'en apparence.
-
-    Réutilise le même regroupement par zone que check_light_coverage() (préfixe avant
-    "_Wall", couloirs détectés par "corr"/"couloir") pour que screenshot et check de
-    couverture lumière portent exactement sur les mêmes zones. Un point de vue par
-    zone (centre XY, z=170 hauteur des yeux, pitch=0, yaw=180 — convention du projet,
-    voir CLAUDE.md "Screenshot fiable") permet de juger visuellement chaque salle
-    individuellement au lieu d'un seul point arbitraire sur tout le level.
-
-    Retourne {zone_key: chemin_png}.
-    """
-    import re
-    from ue5_utils import capture_reference_screenshot
-
-    actors = _actors()
-    geo_boxes = _get_geo_boxes(actors)
-    wall_boxes = [(lbl, o, e) for lbl, o, e in geo_boxes if "wall" in lbl.lower() or "mur" in lbl.lower()]
-
-    zones_raw = _group_walls_by_zone(wall_boxes)
-    zones = {zk: [(o, e) for _, o, e in items] for zk, items in zones_raw.items()}
-
-    paths = {}
-    for zone_key, boxes in zones_raw.items():
-        xs = [o.x for _, o, e in boxes]
-        ys = [o.y for _, o, e in boxes]
-        cx = sum(xs) / len(xs)
-        cy = sum(ys) / len(ys)
-
-        # yaw=180 (regarder vers -X) suppose une salle fermée avec un mur de bout à
-        # l'ouest — correct pour les zones avec des murs Est/Ouest (ou L/R pour un
-        # couloir, où "descendre le couloir" est la vue naturelle). Mais Z3A/Z3B/Z3C
-        # (voir GAME_MEMORY.md layout) n'ont QUE des murs N/S — pas de mur de bout en
-        # X — elles sont ouvertes sur le reste du niveau dans cet axe. Un yaw=180 y
-        # regarde alors à l'infini dans le couloir de jeu entier (vue tunnel jusqu'à
-        # la zone la plus proche encore éclairée), pas la salle elle-même. Pour ces
-        # zones "salle ouverte" (nom ne contenant pas corr/couloir ET aucun mur
-        # E/W/L/R), on tourne la caméra à 90° pour regarder à travers la largeur
-        # contrainte (N à S) à la place — cadrage représentatif de LA zone, pas du
-        # niveau entier vu au travers.
-        has_cap_wall = any(re.search(r"wall(
+def capture_a

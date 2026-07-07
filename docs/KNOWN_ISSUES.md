@@ -128,3 +128,46 @@ there's no way to tell which outcome a given room will produce without
 already knowing what's in it. Rather than guess, the toolchain captures both
 the along-corridor and across-corridor angles for these rooms and leaves the
 choice of which is representative to whoever is reviewing the screenshots.
+
+**A "reliable" screenshot function had never actually been proven reliable —
+it had only been suspected unreliable once, and never re-tested.** An earlier
+session logged 7 consecutive captures that came back pixel-identical despite
+radical scene changes (material swap, light intensity ×44, 8 lights' mobility
+flipped, fog zeroed), and flagged the capture pipeline as suspect. That
+finding sat undisturbed for days — every later session kept building on top
+of the same capture function without anyone re-running the experiment. The
+fix isn't the retest itself (a baseline capture, a deliberate scene change
+placed so it can't self-occlude the one light in frame, a second capture,
+then a diff) — it's turning that retest into a permanent, one-call function
+(`capture_pipeline_selftest()`) with an automated regression test around it,
+so "is the capture pipeline actually working" stops being a fact someone
+remembers from a stale log entry and becomes something re-verified every time
+the test suite runs. Comparison is done by MD5 + file size, not a pixel diff
+— the embedded UE5 Python interpreter has neither PIL nor numpy, so anything
+finer has to happen outside the engine, in the sandbox that does have them.
+
+**A material-defaults check scoped to `wall`/`floor`/`ceil` in the actor
+label silently stopped covering geometry the moment a level's naming
+convention drifted.** A one-off room-dressing script from an earlier session
+(never reintegrated into the shared toolchain) had named its wall segments
+things like `Funnel_N`, `WN_L`, `WS_R`, and named niche end-caps `*_End` —
+none of which contain any of the keywords the checker looked for. 22 surfaces
+sat on the engine's default checkerboard material, on a level whose verifier
+had been reporting zero material errors the whole time. The label-keyword
+filter wasn't just incomplete, it was the wrong kind of check for this
+problem — it required predicting every future naming convention in advance.
+Fixed by dropping the label filter entirely: the check now scans every
+`StaticMeshActor` and relies solely on the material name itself (default
+engine materials like `WorldGridMaterial`/`BasicShapeMaterial` are already an
+unambiguous signal — no legitimate imported asset carries them). The
+auto-fixer that picks a *replacement* material still needs to know wall vs.
+floor vs. ceiling, so it keeps the label check as a first pass and falls back
+to classifying the actor's own bounding-box shape (thin on one horizontal
+axis → wall; thin on Z, low → floor, high → ceiling) when the label doesn't
+say. That same widened check then had a second-order effect worth noting:
+once it stopped filtering by label, it started flagging small gameplay props
+(a table, cover objects) that also happened to carry a default material —
+correct to detect, but treating a mislabeled cover object as a level-blocking
+error alongside an un-textured wall was disproportionate. The check now
+returns errors and warnings separately, using the same bounding-box shape
+test to decide which bucket a given surface belongs in.

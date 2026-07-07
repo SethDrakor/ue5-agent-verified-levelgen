@@ -707,6 +707,115 @@ def build_and_critique(build_fn, capture_pos=None, name="critique", *args, **kwa
     return {"build_result": result, "screenshot": path}
 
 
+def capture_pipeline_selftest(cleanup=True):
+    """Test canari : confirme que capture_reference_screenshot() reflète bien un changement
+    réel de scène, plutôt que de le supposer.
+
+    Doute jamais reconfirmé depuis la session "quinquies" du 2026-07-03 (voir GAME_MEMORY.md) :
+    7 captures consécutives étaient revenues pixel-identiques malgré des changements radicaux de
+    scène (matériau, intensité ×44, mobilité de 8 lumières, fog à 0...). Tant que ce doute n'était
+    pas retesté, toute validation d'ambiance basée sur capture_reference_screenshot() restait
+    fragile. Ce test construit une scène isolée à (733000, 733000) — loin de toute géométrie de
+    jeu réelle, même convention que les tests de test_suite.py qui spawnent de vrais acteurs —
+    capture une baseline (sol + lumière faible), ajoute un cube + lumière colorée bien identifiable
+    à côté (sans bloquer la première lumière — piège rencontré lors du premier essai manuel : un
+    gros cube placé PILE devant la lumière donne un écran noir légitime, pas un bug de pipeline),
+    recapture, puis compare les deux fichiers.
+
+    Comparaison en pur stdlib (taille + MD5) : le Python embarqué UE5 n'a NI PIL NI numpy (vérifié
+    2026-07-03) donc ce check ne peut PAS mesurer un vrai diff pixel — seulement détecter le cas
+    grossier "fichier identique => pipeline probablement figé/périmé". Pour une analyse fine
+    (% pixels changés, luminance...), passer les 2 chemins retournés à un diff PIL/numpy côté
+    Claude Cowork (sandbox) — voir Tools/analyze_screenshot.py pour le pattern équivalent côté
+    ambiance perceptuelle.
+
+    cleanup : si True (défaut), détruit les acteurs de test après capture.
+
+    Retourne {"baseline": path, "after": path, "size_baseline": int, "size_after": int,
+              "md5_baseline": str, "md5_after": str, "identical": bool, "verdict": str}.
+
+    Exemple :
+        r = capture_pipeline_selftest()
+        print(r["verdict"])
+        # Puis, côté Claude Cowork : Read(r["baseline"]) et Read(r["after"]) pour confirmer
+        # visuellement — ce test ne remplace pas le jugement visuel, il détecte juste le cas où
+        # le pipeline ne bouge plus du tout, avant même d'y regarder.
+    """
+    import hashlib
+
+    TX, TY = 733000.0, 733000.0
+    a_sub = aeas()
+
+    def _cleanup_canary():
+        for a in a_sub.get_all_level_actors():
+            if a.get_actor_label() and a.get_actor_label().startswith("CANARY_"):
+                a_sub.destroy_actor(a)
+
+    _cleanup_canary()  # résidu d'un appel précédent interrompu
+
+    cube_mesh = unreal.load_asset("/Engine/BasicShapes/Cube.Cube")
+
+    floor = a_sub.spawn_actor_from_class(unreal.StaticMeshActor.static_class(), unreal.Vector(TX, TY, 0))
+    floor.set_actor_label("CANARY_Floor")
+    floor.set_actor_scale3d(unreal.Vector(20, 20, 1))
+    floor.get_component_by_class(unreal.StaticMeshComponent.static_class()).set_static_mesh(cube_mesh)
+
+    light = a_sub.spawn_actor_from_class(unreal.PointLight.static_class(), unreal.Vector(TX, TY, 300))
+    light.set_actor_label("CANARY_Light")
+    lc = light.point_light_component
+    lc.set_editor_property("intensity", 5000.0)
+    lc.set_editor_property("attenuation_radius", 1500.0)
+    lc.set_mobility(unreal.ComponentMobility.MOVABLE)
+
+    path_baseline = capture_reference_screenshot(TX, TY - 400, 150, pitch=0, yaw=90, name="canary_selftest_baseline")
+
+    # Cube + lumière décalés SUR LE CÔTÉ (x+150) — ne bloquent pas CANARY_Light, sinon un
+    # écran noir serait un vrai résultat physique (occlusion) et non un signal de pipeline figé.
+    cube = a_sub.spawn_actor_from_class(unreal.StaticMeshActor.static_class(), unreal.Vector(TX + 150, TY - 250, 100))
+    cube.set_actor_label("CANARY_SideCube")
+    cube.set_actor_scale3d(unreal.Vector(1.2, 1.2, 1.2))
+    cube.get_component_by_class(unreal.StaticMeshComponent.static_class()).set_static_mesh(cube_mesh)
+
+    side_light = a_sub.spawn_actor_from_class(unreal.PointLight.static_class(), unreal.Vector(TX + 150, TY - 250, 200))
+    side_light.set_actor_label("CANARY_SideLight")
+    slc = side_light.point_light_component
+    slc.set_editor_property("light_color", unreal.Color(0, 0, 255, 255))
+    slc.set_editor_property("intensity", 15000.0)
+    slc.set_editor_property("attenuation_radius", 400.0)
+    slc.set_mobility(unreal.ComponentMobility.MOVABLE)
+
+    path_after = capture_reference_screenshot(TX, TY - 400, 150, pitch=0, yaw=90, name="canary_selftest_after")
+
+    if cleanup:
+        _cleanup_canary()
+
+    def _md5(p):
+        with open(p, "rb") as f:
+            return hashlib.md5(f.read()).hexdigest()
+
+    size_b, size_a = os.path.getsize(path_baseline), os.path.getsize(path_after)
+    md5_b, md5_a = _md5(path_baseline), _md5(path_after)
+    identical = (md5_b == md5_a)
+
+    if identical:
+        verdict = ("SUSPECT: fichiers identiques (meme MD5) malgre un changement de scene "
+                   "radical -> pipeline de capture probablement fige/perime, voir GAME_MEMORY.md "
+                   "'quinquies' 2026-07-03. NE PAS FAIRE CONFIANCE a capture_reference_screenshot() "
+                   "avant investigation (focus fenetre editeur ? throttling Slate ?).")
+    else:
+        verdict = ("OK: fichiers differents (MD5 differents, tailles {} vs {} octets) -> le "
+                   "pipeline reflete bien le changement de scene.".format(size_b, size_a))
+
+    unreal.log("[capture_pipeline_selftest] " + verdict)
+
+    return {
+        "baseline": path_baseline, "after": path_after,
+        "size_baseline": size_b, "size_after": size_a,
+        "md5_baseline": md5_b, "md5_after": md5_a,
+        "identical": identical, "verdict": verdict,
+    }
+
+
 def safe_spawn(cls_or_path, x, y, z=100, label=None, grid=None):
     """Spawn un acteur avec garantie zéro overlap (utilise safe_place).
 
@@ -1179,112 +1288,4 @@ def safe_append(path, content, must_contain=None):
     if must_contain:
         for needle in (must_contain if isinstance(must_contain, list) else [must_contain]):
             if needle not in written:
-                raise Exception("safe_append ECHEC: '{}' manquant dans {}".format(needle, path))
-    unreal.log("[safe_append] OK {} ({} chars total)".format(os.path.basename(path), len(written)))
-    return len(written)
-
-
-# ══════════════════════════════════════════════════════
-# ANTI-REGRESSION AUTOMATIQUE — safe_modify_plugin()
-# ══════════════════════════════════════════════════════
-#
-# Avant cette fonction, "lancer run_all() avant/apres toute modif C++/Python"
-# n'etait qu'une regle ECRITE dans CLAUDE.md — rien dans le code ne l'imposait.
-# Un agent (ou un humain) pressé pouvait modifier le plugin et sauvegarder sans
-# avoir lancé un seul test, exactement comme il pouvait autrefois appeler save()
-# sans avoir passé run_verify() avant que ce garde-fou existe pour le level design.
-# safe_modify_plugin() transforme cette convention en mécanisme : baseline avant,
-# modification, re-check après, comparaison test par test — pas juste "ça passe
-# globalement" mais "CE test précis, qui passait avant, échoue maintenant".
-
-def safe_modify_plugin(fn, *args, **kwargs):
-    """Encapsule une modification risquée du plugin (C++/Python, BP wiring, etc.)
-    avec un filet de sécurité anti-régression automatique.
-
-    Principe (identique à fix_all()+run_verify() avant save() pour le level design,
-    appliqué ici au CODE du plugin plutôt qu'à la géométrie du niveau) :
-        1. Lance test_suite.run_all() AVANT la modification → baseline.
-        2. Si la baseline elle-même a des échecs → arrêt immédiat (pas de baseline
-           fiable, inutile de comparer après).
-        3. Exécute fn(*args, **kwargs) — la modification à risque.
-        4. Relance test_suite.run_all() APRès la modification.
-        5. Compare test par test (pas juste le score global) : si un test qui
-           était [OK] en baseline est [FAIL] après → régression réelle détectée
-           → lève une Exception. Un test déjà cassé avant qui l'est encore après
-           n'est PAS une régression (ce n'est pas la faute de cette modification).
-
-    fn : callable sans argument obligatoire qui effectue la modification
-         (ex: une fonction qui appelle BPGraph(...).wire_and_compile(), ou qui
-         réimporte un module C++ après recompilation).
-
-    Retourne le résultat de fn() si aucune régression n'est détectée.
-    Lève une Exception si :
-      - la baseline elle-même échoue (tests déjà cassés avant modif — corriger
-        d'abord, ne pas empiler une nouvelle modif sur une base déjà rouge) ;
-      - une régression réelle est détectée après la modif.
-
-    Exemple :
-        def ma_modif():
-            bp = load_bp("/Game/Path/BP_Name")
-            g  = BPGraph(bp, "EventGraph")
-            ev = g.event("BeginPlay")
-            fn = g.call("PrintString", "/Script/Engine.KismetSystemLibrary")
-            ev >> fn
-            return g.wire_and_compile()
-
-        result = safe_modify_plugin(ma_modif)
-        # → lève une Exception si la modif casse un test qui passait avant,
-        #   sinon retourne le "OK: N nodes, M connections" de wire_and_compile().
-    """
-    import sys
-
-    def _reload_and_run(verbose):
-        # Reimport obligatoire : sans ça, un test_suite/ue5_utils déjà en mémoire
-        # masquerait une régression introduite par une recompilation C++ récente
-        # (voir CLAUDE.md — "Cache Python — reimporter apres modif ue5_utils").
-        for m in list(sys.modules):
-            if m in ("ue5_utils", "test_suite"):
-                del sys.modules[m]
-        import test_suite as _ts
-        ok = _ts.run_all(verbose=verbose)
-        snapshot = {name: status for status, name, _ in _ts._results}
-        return ok, snapshot, _ts._OK, _ts._FAIL
-
-    print("[safe_modify_plugin] Baseline AVANT modification...")
-    baseline_ok, baseline, OK_TAG, FAIL_TAG = _reload_and_run(verbose=False)
-    if not baseline_ok:
-        failed = [n for n, s in baseline.items() if s == FAIL_TAG]
-        raise Exception(
-            "[safe_modify_plugin] ARRET : {} test(s) déjà en échec AVANT la "
-            "modification (baseline non fiable) : {}. Corriger l'existant "
-            "d'abord — ne pas modifier sur une base déjà rouge.".format(
-                len(failed), failed))
-    print("[safe_modify_plugin] Baseline OK ({} tests). Exécution de la "
-          "modification...".format(len(baseline)))
-
-    result = fn(*args, **kwargs)
-
-    print("[safe_modify_plugin] Vérification APRÈS modification...")
-    after_ok, after, _, _ = _reload_and_run(verbose=False)
-
-    regressions = [
-        name for name, status in after.items()
-        if baseline.get(name) == OK_TAG and status == FAIL_TAG
-    ]
-
-    if regressions:
-        raise Exception(
-            "[safe_modify_plugin] REGRESSION DETECTEE : {} test(s) passaient "
-            "avant la modification et échouent maintenant : {}. La modification "
-            "N'A PAS été considérée sûre — corriger avant de sauvegarder ou de "
-            "continuer.".format(len(regressions), regressions))
-
-    if not after_ok:
-        still_failing = [n for n, s in after.items() if s == FAIL_TAG]
-        print("[safe_modify_plugin] ATTENTION : {} test(s) toujours en échec, "
-              "mais déjà cassés avant la modif — pas une nouvelle régression : "
-              "{}".format(len(still_failing), still_failing))
-
-    print("[safe_modify_plugin] OK — aucune régression détectée ({} tests).".format(
-        len(after)))
-    return result
+        

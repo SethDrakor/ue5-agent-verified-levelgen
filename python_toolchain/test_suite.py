@@ -443,132 +443,118 @@ def _test_occupancy_grid_unit():
 
 
 # ─────────────────────────────────────────────────────────────
-# Test MANUEL (PAS appele par run_all()) — bake_lighting()/unbake_lighting()
+# Groupes de tests (2026-07-07) — boucle vision : capture par zone +
+# fiabilite du pipeline de capture lui-meme. Ajoutes suite a la session du
+# 2026-07-07 (voir GAME_MEMORY.md) qui a trouve 3 bugs reels dans
+# capture_all_zones_screenshots()/_group_walls_by_zone() le jour meme de
+# leur creation, sans qu'aucun test ne les couvre — TODO explicitement
+# note dans GAME_MEMORY.md, ferme ici.
 # ─────────────────────────────────────────────────────────────
-# Volontairement exclu du chemin automatique (run_all(), donc aussi
-# wire_and_compile()/safe_modify_plugin()) : un bake reel meme en quality=
-# "preview" a mesure ~8.4s sur ce level (voir GAME_MEMORY.md session 12) —
-# double a ~17s dans le mecanisme avant/apres, et touche reellement les
-# donnees d'eclairage du niveau ENTIER (pas juste une fixture isolee comme
-# les autres tests). A appeler explicitement apres toute modification de
-# bake_lighting()/unbake_lighting() dans ue5_utils.py :
-#   from test_suite import test_bake_lighting_mobility
-#   test_bake_lighting_mobility()
 
-def test_bake_lighting_mobility():
-    """Garde contre 2 pieges deja documentes dans CLAUDE.md/ue5_utils.py :
-    piege n°1 — une lumiere Movable ignore totalement un bake (donc bake_lighting()
-    DOIT basculer la mobilite en Stationary avant de bake) ; piege n°2 — ce pipeline
-    utilise Movable partout par choix delibere, donc unbake_lighting() doit pouvoir
-    revenir proprement en Movable apres un bake ponctuel.
+def _test_group_walls_by_zone():
+    """Garde contre le bug reel decouvert le 2026-07-07 (session 13) : Zone1/Zone2
+    partagent les memes murs N/S continus (prefixe "Z2_"), seul un mur de bout
+    degenere porte le prefixe "Z1_" -> un regroupement naif par prefixe cree un
+    groupe fantome "Z1" avec une seule box fine (20x1200 UU), dont le centre
+    calcule tombe sur le mur au lieu de la piece (screenshot noir, couverture
+    lumiere mesuree sur presque rien). _group_walls_by_zone() doit fusionner ce
+    groupe degenere dans son voisin le plus proche plutot que de le traiter comme
+    une zone a part entiere.
+
+    100% pur Python (aucun acteur UE5, pas de niveau requis) — rapide et deterministe,
+    contrairement aux autres tests de ce fichier qui spawnent de vrais acteurs.
     """
     try:
-        from ue5_utils import point_light, bake_lighting, unbake_lighting, destroy
+        from verify_level import _group_walls_by_zone
     except Exception as e:
-        unreal.log_error(f"[FAIL] bake_lighting import: {e}")
-        return False
+        _results.append((_FAIL, "_group_walls_by_zone import", str(e)))
+        return
 
-    local_results = []
+    class _FakeVec:
+        def __init__(self, x, y, z=0):
+            self.x, self.y, self.z = x, y, z
 
-    def _t(name, fn):
-        try:
-            ok = fn()
-            local_results.append((_OK if ok else _FAIL, name, "" if ok else "returned falsy"))
-        except Exception as e:
-            local_results.append((_FAIL, name, str(e)))
+    # Reproduit la topologie exacte qui a revele le bug sur HorrorLevel.
+    wall_boxes = [
+        ("Z2_WallN", _FakeVec(700, 600), _FakeVec(1938, 20)),
+        ("Z2_WallS", _FakeVec(700, -600), _FakeVec(1938, 20)),
+        ("Z1_WallW", _FakeVec(0, 0), _FakeVec(20, 600)),
+        ("Z2_WallE", _FakeVec(1400, 0), _FakeVec(20, 600)),
+    ]
+    zones = _group_walls_by_zone(wall_boxes)
 
-    pl = point_light(_TEST_FAR_X, _TEST_FAR_Y, 500, intensity=500,
-                      rgb=(255, 255, 255), radius=300, label="_TestSuite_BakeLight")
+    _test("_group_walls_by_zone - pas de groupe fantome 'Z1' isole",
+          lambda: "Z1" not in zones)
+    _test("_group_walls_by_zone - Z1_WallW fusionne dans Z2",
+          lambda: any(lbl == "Z1_WallW" for lbl, _, _ in zones.get("Z2", [])))
+    _test("_group_walls_by_zone - Z2 garde bien ses propres murs",
+          lambda: any(lbl == "Z2_WallN" for lbl, _, _ in zones.get("Z2", [])))
+
+    # Cas non-degenere : deux zones bien formees (2 murs chacune, vraie etendue)
+    # doivent rester separees, pas fusionnees entre elles.
+    wall_boxes_2 = [
+        ("Z3A_WallN", _FakeVec(5000, 600), _FakeVec(600, 20)),
+        ("Z3A_WallS", _FakeVec(5000, -600), _FakeVec(600, 20)),
+        ("Z3B_WallN", _FakeVec(6700, 600), _FakeVec(600, 20)),
+        ("Z3B_WallS", _FakeVec(6700, -600), _FakeVec(600, 20)),
+    ]
+    zones_2 = _group_walls_by_zone(wall_boxes_2)
+    _test("_group_walls_by_zone - deux zones bien formees restent separees",
+          lambda: "Z3A" in zones_2 and "Z3B" in zones_2 and len(zones_2) == 2)
+
+
+def _test_capture_all_zones_screenshots():
+    """Garde d'INTEGRATION (pas unitaire) : verifie que capture_all_zones_screenshots()
+    tourne sans crash sur le level reellement ouvert et produit de vrais fichiers PNG,
+    sans presumer d'un nombre de zones/etiquettes precis (ca depend du level ouvert au
+    moment du test — la logique fine de regroupement est deja couverte, deterministe,
+    par _test_group_walls_by_zone() ci-dessus). Couvre le reste du pipeline : calcul de
+    centre par zone, choix d'angle de camera, appel reel a capture_reference_screenshot().
+
+    Nettoie les fichiers generes apres coup (prefixe dedie _testsuite_, ne pollue pas les
+    captures de verification reelles dans Saved/Screenshots/WindowsEditor/).
+    """
     try:
-        _t("bake_lighting - acteur de test cree", lambda: pl is not None)
-        if pl is None:
-            return False
-        lc = pl.point_light_component
+        from verify_level import capture_all_zones_screenshots
+    except Exception as e:
+        _results.append((_FAIL, "capture_all_zones_screenshots import", str(e)))
+        return
 
-        _t("bake_lighting - mobilite initiale MOVABLE",
-           lambda: lc.get_editor_property("mobility") == unreal.ComponentMobility.MOVABLE)
+    paths = {}
+    try:
+        paths = capture_all_zones_screenshots(name_prefix="_testsuite_zone")
 
-        ok = bake_lighting(labels=["_TestSuite_BakeLight"], quality="preview",
-                            with_reflection_captures=False)
-        _t("bake_lighting - build_light_maps reussi", lambda: ok)
-        _t("bake_lighting - mobilite basculee en STATIONARY avant bake (ex-piege n°1)",
-           lambda: lc.get_editor_property("mobility") == unreal.ComponentMobility.STATIONARY)
+        _test("capture_all_zones_screenshots - retourne un dict",
+              lambda: isinstance(paths, dict))
 
-        unbake_lighting(labels=["_TestSuite_BakeLight"])
-        _t("unbake_lighting - mobilite revenue en MOVABLE (ex-piege n°2)",
-           lambda: lc.get_editor_property("mobility") == unreal.ComponentMobility.MOVABLE)
+        if not paths:
+            _results.append((_SKIP, "capture_all_zones_screenshots - contenu",
+                              "aucune zone de mur detectee sur le level actuellement ouvert"))
+            return
+
+        _test("capture_all_zones_screenshots - tous les fichiers existent",
+              lambda: all(p and os.path.exists(p) for p in paths.values()))
+
+        def _all_valid_png():
+            PNG_MAGIC = b"\x89\x50\x4E\x47"
+            for p in paths.values():
+                if not p or not os.path.exists(p):
+                    return False
+                with open(p, "rb") as f:
+                    if f.read(4) != PNG_MAGIC:
+                        return False
+            return True
+
+        _test("capture_all_zones_screenshots - tous les fichiers sont de vrais PNG",
+              _all_valid_png)
     finally:
-        if pl is not None:
-            destroy(pl)
-
-    passed = sum(1 for s, _, _ in local_results if s == _OK)
-    failed = sum(1 for s, _, _ in local_results if s == _FAIL)
-    total = len(local_results)
-
-    unreal.log("=" * 55)
-    unreal.log("  TEST MANUEL — bake_lighting() / unbake_lighting()")
-    unreal.log("=" * 55)
-    for status, name, msg in local_results:
-        line = f"  {status} {name}"
-        if msg:
-            line += f"  ({msg})"
-        if status == _OK:
-            unreal.log(line)
-        else:
-            unreal.log_error(line)
-    icon = "TOUT OK" if failed == 0 else f"{failed} ECHEC(S) !"
-    unreal.log(f"  {passed}/{total} passes → {icon}")
-    unreal.log("=" * 55)
-
-    return failed == 0
+        for p in paths.values():
+            if p and os.path.exists(p):
+                try:
+                    os.remove(p)
+                except Exception:
+                    pass
 
 
-# ─────────────────────────────────────────────────────────────
-# Point d'entree
-# ─────────────────────────────────────────────────────────────
-
-def run_all(verbose=True):
-    global _results
-    _results = []
-
-    if not _create_test_bp():
-        unreal.log_error("[TEST SUITE] Impossible de creer le BP de test")
-        return False
-
-    bp = _bp_test
-
-    _test_bpes(bp)
-    _test_batch_wire(bp)
-    _test_bgh(bp)
-    _test_ue5_utils(bp)
-
-    _cleanup()
-
-    _test_point_light()
-    _test_safe_spawn_enemy()
-    _test_occupancy_grid_skydome_guard()
-    _test_load_bp_class()
-    _test_capture_reference_screenshot()
-    _test_occupancy_grid_unit()
-
-    passed = sum(1 for s, _, _ in _results if s == _OK)
-    failed = sum(1 for s, _, _ in _results if s == _FAIL)
-    skipped= sum(1 for s, _, _ in _results if s == _SKIP)
-    total  = len(_results)
-
-    if verbose:
-        unreal.log("=" * 55)
-        unreal.log("  TEST SUITE — HorrorGame Plugin")
-        unreal.log("=" * 55)
-        for status, name, msg in _results:
-            line = f"  {status} {name}"
-            if msg: line += f"  ({msg})"
-            if status == _OK:   unreal.log(line)
-            elif status == _SKIP: unreal.log(line)
-            else:               unreal.log_error(line)
-        unreal.log("=" * 55)
-        icon = "TOUT OK" if failed == 0 else f"{failed} ECHEC(S) !"
-        unreal.log(f"  {passed}/{total} passes  {skipped} skips  → {icon}")
-        unreal.log("=" * 55)
-
-    return failed == 0
+def _test_check_materials_geometry_fallback():
+    """Garde contre le b
