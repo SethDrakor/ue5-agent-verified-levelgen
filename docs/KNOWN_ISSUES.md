@@ -171,3 +171,31 @@ correct to detect, but treating a mislabeled cover object as a level-blocking
 error alongside an un-textured wall was disproportionate. The check now
 returns errors and warnings separately, using the same bounding-box shape
 test to decide which bucket a given surface belongs in.
+
+**The Cowork agent's Linux sandbox can serve a stale, truncated view of a
+file that was just edited on the Windows side — with no error, and no
+convergence after retrying or waiting.** After editing a ~90KB Python file
+through the agent's file-edit tool, a shell command in the same agent's
+Linux sandbox (`wc -l`, `tail`, `sha256sum`) reported a *shorter* file than
+what was actually on disk — cut off mid-statement, at a fixed byte offset
+that didn't move across repeated checks, several `sleep`s, or several
+minutes of elapsed time. `python3 -m py_compile` even reported success on
+the truncated copy, because the cut happened to land right after a complete
+assignment statement — truncation alone isn't guaranteed to produce a
+`SyntaxError`. The authoritative file-read tool (the one backing the editor,
+not the shell) showed the complete, correct file throughout; re-importing
+the module directly inside the running Unreal Engine process and executing
+it (not just compiling it) also worked correctly and matched the edit. The
+mismatch was specific to the shell's mounted view of that one file, not the
+file itself. Root cause not confirmed (a caching layer on the Windows↔Linux
+bridge is the leading suspect, consistent with the NUL-padding bug logged
+above, but this manifested as truncation with zero padding bytes instead).
+**Practical rule adopted**: after editing a file that lives on this mount,
+verify its content through the same tool that did the edit (or by re-running
+it in the real target process, e.g. Unreal's embedded Python), never through
+a shell command in the agent's sandbox — and never `cp` such a file from the
+sandbox shell as a way to "sync" it elsewhere, since that would just copy
+the stale truncated view. Copying it via a script executed by the *target*
+process (Unreal's own Python, which reads the real Windows filesystem
+directly) and verifying with a hash comparison in that same call sidesteps
+the problem entirely.

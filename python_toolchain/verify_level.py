@@ -236,6 +236,7 @@ def check_gameplay_completeness(actors):
 def check_duplicates(actors):
     """Détecte les acteurs dupliqués (PostProcess, PlayerStart, etc.)."""
     warnings = []
+    from collections import Counter
     pp_count = sum(1 for a in actors if "PostProcess" in a.get_actor_label())
     ps_count = sum(1 for a in actors if "PlayerStart" in a.get_class().get_name())
     if pp_count > 1:
@@ -268,7 +269,7 @@ def check_navmesh_rebuild(world):
             warnings.append("NAVMESH NON BUILTÉ: faire Build → Build Paths dans UE5 (menu Build en haut)")
         else:
             pass  # NavMesh OK, pas de warning
-    except Exception:
+    except Exception as e:
         # Fallback : vérifier juste que RecastNavMesh-Default existe
         has_recast = any("RecastNavMesh" in a.get_class().get_name()
                          for a in _actors())
@@ -666,6 +667,7 @@ def capture_all_zones_screenshots(name_prefix="verify_zone"):
     wall_boxes = [(lbl, o, e) for lbl, o, e in geo_boxes if "wall" in lbl.lower() or "mur" in lbl.lower()]
 
     zones_raw = _group_walls_by_zone(wall_boxes)
+    zones = {zk: [(o, e) for _, o, e in items] for zk, items in zones_raw.items()}
 
     paths = {}
     for zone_key, boxes in zones_raw.items():
@@ -798,7 +800,7 @@ def run_verify(take_screenshot=True, level_name=None):
 
     # Rapport final
     print(f"\n{'='*50}")
-    print("RAPPORT FINAL")
+    print(f"RAPPORT FINAL")
     print(f"{'='*50}")
 
     if all_errors:
@@ -806,21 +808,21 @@ def run_verify(take_screenshot=True, level_name=None):
         for e in all_errors:
             print(f"   • {e}")
     else:
-        print("\n✅ Aucune erreur bloquante")
+        print(f"\n✅ Aucune erreur bloquante")
 
     if all_warnings:
         print(f"\n⚠  WARNINGS ({len(all_warnings)}) — level jouable mais imparfait :")
         for w in all_warnings:
             print(f"   • {w}")
     else:
-        print("\n✅ Aucun warning")
+        print(f"\n✅ Aucun warning")
 
     if not all_errors and not all_warnings:
-        print("\n🎮 LEVEL PARFAITEMENT JOUABLE")
+        print(f"\n🎮 LEVEL PARFAITEMENT JOUABLE")
 
     if screenshot_path:
         print(f"\n📸 Screenshot: {screenshot_path}")
-        print("   (lire avec Read tool pour vérification visuelle)")
+        print(f"   (lire avec Read tool pour vérification visuelle)")
 
     playable = len(all_errors) == 0
     print(f"\n{'='*50}")
@@ -972,3 +974,142 @@ def fix_all():
 
 
 print("[verify_level] loaded — from verify_level import run_verify, fix_all")
+
+
+# ══════════════════════════════════════════════════════
+# BOUCLE QC FERMEE — verified_zone_build()
+# Ajoute le 2026-07-08 : ferme la partie STRUCTURELLE de la boucle de verification
+# perceptuelle (voir CLAUDE.md "point le plus critique" identifie en session -- jusqu'ici
+# execute_level_plan() lancait fix_all()+run_verify() UNE SEULE fois a la fin, sans relance
+# si des erreurs auto-corrigibles connues restaient, et sans jamais consolider le retour
+# numerique de Tools/analyze_screenshot.py avec le retour structurel de run_verify(). Cette
+# fonction NE REMPLACE PAS le jugement visuel (impossible depuis l'UE5 Python embarque, qui
+# n'a ni PIL ni numpy ni acces vision) -- elle relance automatiquement les correctifs connus
+# (PostProcess absent, Lumen actif, exposition mal calibree, couverture lumiere insuffisante)
+# jusqu'a un plafond d'iterations, PUIS capture un screenshot fiable et remet la main a
+# l'agent avec vision (Claude Cowork) pour la partie perceptuelle -- voir Tools/qc_gate.py
+# qui consolide ce retour structurel avec l'analyse numerique de pixels en un seul verdict.
+# ══════════════════════════════════════════════════════
+
+def verified_zone_build(build_fn, zone_name, x_min, x_max, cx=None, cy=0,
+                          style="silent_hill", max_passes=3, capture_pos=None):
+    """Boucle fermee build -> fix -> re-verifie -> capture, avec relance automatique
+    plafonnee des correctifs structurels connus (PAS un remplacement du jugement visuel).
+
+    Workflow :
+      1. build_fn() -- construit la salle/le couloir.
+      2. Boucle (max max_passes) : fix_all() -> checks structurels complets -> si une
+         erreur connue auto-corrigible reste (PostProcess absent / Lumen actif /
+         exposition mal calibree -> setup_global_atmosphere(style) ; couverture lumiere
+         insuffisante -> lumiere de remplissage ciblee) -> reboucle. Sinon, sort de la
+         boucle immediatement (pas d'iteration inutile).
+      3. Capture UN screenshot fiable (capture_pos explicite, sinon centre de zone calcule
+         depuis x_min/x_max/cx/cy, hauteur des yeux, yaw=180 -- convention du projet).
+      4. Retourne un rapport consolide -- NE DECLARE JAMAIS le level "termine" seul.
+
+    ETAPE OBLIGATOIRE SUIVANTE (a faire par l'agent qui a appele cette fonction, PAS par
+    un agent texte seul -- voir CLAUDE.md routage agent UE5 vs Claude Cowork : tout ce qui
+    touche a l'ambiance visuelle doit passer par un agent avec vision) :
+        - Lire le screenshot retourne avec Read
+        - Lancer Tools/qc_gate.py dessus (+ le rapport errors/warnings de ce retour) pour
+          le verdict numerique consolide
+        - Si echec (structurel restant, numerique, OU jugement visuel direct) : appliquer
+          le correctif approprie, rappeler verified_zone_build() sur la MEME zone, jusqu'a
+          un plafond raisonnable (recommande : 3 appels complets) puis remonter le probleme
+          a l'utilisateur plutot que boucler indefiniment ou declarer un faux succes.
+
+    LIMITE CONNUE (scaffold, pas une solution complete) : le correctif de couverture
+    lumiere ajoute une lumiere de remplissage au centre (cx, cy) fourni en argument --
+    correct pour un appel salle-par-salle (le cas d'usage principal), mais n'essaie pas de
+    localiser precisement quelle sous-zone d'un level multi-salles est concernee si
+    verified_zone_build() est appele sur un level entier deja construit (cx/cy unique).
+
+    Retourne :
+        {"zone_name": str, "errors": [...], "warnings": [...], "screenshot": path,
+         "passes": int, "structural_pass": bool}
+    """
+    import re, time
+    from ue5_utils import capture_reference_screenshot, point_light
+
+    build_fn()
+
+    if cx is None:
+        cx = (x_min + x_max) / 2
+
+    world = _world()
+    passes_done = 0
+    errors, warnings = [], []
+
+    for i in range(max_passes):
+        passes_done = i + 1
+        fix_all()
+
+        actors = _actors()
+        geo_boxes = _get_geo_boxes(actors)
+
+        errors, warnings = [], []
+        errors += check_actor_positions(actors, world, geo_boxes)
+        errors += check_enemy_tags(actors)
+        warnings += check_lights(actors)
+        errors += check_gameplay_completeness(actors)
+        warnings += check_duplicates(actors)
+        warnings += check_navmesh_rebuild(world)
+        e, w = check_materials(actors)
+        errors += e; warnings += w
+        errors += check_postprocess_atmosphere(actors)
+        errors += check_default_level_lighting(actors)
+        e, w = check_light_coverage(actors, geo_boxes)
+        errors += e; warnings += w
+
+        atmosphere_issues = [er for er in errors if any(k in er for k in (
+            "POSTPROCESS ABSENT", "LUMEN ACTIF", "EXPOSITION MANUELLE MAL CALIBREE"
+        ))]
+        coverage_issues = [er for er in errors if "SALLE TROP SOMBRE" in er]
+
+        if not atmosphere_issues and not coverage_issues:
+            print(f"[verified_zone_build] '{zone_name}' pass {passes_done}: "
+                  f"plus d'erreur auto-corrigible connue -- arret de la boucle.")
+            break
+
+        if atmosphere_issues:
+            try:
+                from horror_presets import setup_global_atmosphere
+                setup_global_atmosphere(style)
+                print(f"[verified_zone_build] pass {passes_done}: setup_global_atmosphere("
+                      f"'{style}') relance ({len(atmosphere_issues)} erreur(s) PP/Lumen/exposition)")
+            except Exception as ex:
+                print(f"[verified_zone_build] setup_global_atmosphere a echoue: {ex}")
+
+        if coverage_issues:
+            point_light(cx, cy, 30, intensity=700, rgb=(200, 190, 170), radius=550,
+                        label=f"AutoFix_Fill_{zone_name}_{passes_done}")
+            print(f"[verified_zone_build] pass {passes_done}: lumiere de remplissage "
+                  f"ajoutee @ ({int(cx)},{int(cy)},30) pour couverture insuffisante "
+                  f"({len(coverage_issues)} zone(s) concernee(s))")
+
+    if capture_pos:
+        px, py, pz, ppitch, pyaw, proll = capture_pos
+    else:
+        px, py, pz, ppitch, pyaw, proll = cx, cy, 170, 0, 180, 0
+
+    safe_name = re.sub(r"[^A-Za-z0-9_]", "_", zone_name.lower())
+    screenshot_path = capture_reference_screenshot(
+        px, py, pz, pitch=ppitch, yaw=pyaw, roll=proll,
+        name=f"vzb_{safe_name}_{int(time.time())}"
+    )
+
+    structural_pass = len(errors) == 0
+    print(f"\n[verified_zone_build] '{zone_name}' -- {passes_done} passe(s), "
+          f"{len(errors)} erreur(s) restante(s), {len(warnings)} warning(s)")
+    print(f"[verified_zone_build] Screenshot: {screenshot_path}")
+    print("[verified_zone_build] ETAPE OBLIGATOIRE SUIVANTE : Read(screenshot) + "
+          "Tools/qc_gate.py avant de declarer quoi que ce soit termine.")
+
+    return {
+        "zone_name": zone_name, "errors": errors, "warnings": warnings,
+        "screenshot": screenshot_path, "passes": passes_done,
+        "structural_pass": structural_pass,
+    }
+
+
+print("[verify_level] verified_zone_build() charge -- boucle QC fermee (structurel + capture)")

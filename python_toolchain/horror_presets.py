@@ -13,9 +13,10 @@ Contient :
 
 import unreal
 import random
-from ue5_utils import (aeas, point_light, place_static_mesh,
+from ue5_utils import (aeas, spawn, point_light, place_static_mesh,
                        scatter_props, tag_actor, save,
-                       build_occupancy_grid_from_level, safe_spawn_enemy)
+                       build_occupancy_grid_from_level, safe_spawn_enemy,
+                       actor_by_label, all_actors)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -692,6 +693,7 @@ def apply_material_to_zone(x_min, x_max, style="silent_hill",
         apply_material_to_zone(0, 1400, style="silent_hill")
     """
     preset = WALL_PRESETS.get(style, WALL_PRESETS["silent_hill"])
+    zone_tag = "z{}_".format(int((x_min + x_max) / 2 / 1400) + 1)
 
     # Creer les instances si pas de custom
     mi_wall  = custom_wall  or create_material_instance(
@@ -1018,7 +1020,14 @@ def audit_zone(zone_name, x_min, x_max, cx=None, cy=0):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def take_viewport_screenshot(filename="horror_audit"):
-    """Prend un screenshot du viewport UE5 actif et retourne le chemin du fichier.
+    """[DEPRECATED 2026-07-08] Prend un screenshot du viewport UE5 actif via HighResShot.
+
+    NE PLUS UTILISER pour un nouvel audit -- meme classe de bug que take_screenshot()
+    dans ue5_utils.py (mise en file d'attente pour un frame futur qui peut ne jamais
+    arriver avant la lecture du fichier dans un contexte agent -- voir CLAUDE.md
+    "Screenshot fiable"). audit_zone_full() a ete corrige le 2026-07-08 pour utiliser
+    capture_reference_screenshot() a la place -- ce doublon reste seulement pour ne pas
+    casser un appel existant qui s'y referencerait directement.
 
     Le screenshot est sauvegarde dans :
         {ProjectDir}/Saved/Screenshots/Windows/{filename}*.png
@@ -1069,23 +1078,40 @@ def take_viewport_screenshot(filename="horror_audit"):
         return save_dir
 
 
-def audit_zone_full(zone_name, x_min, x_max, cx=None, cy=0):
-    """Audit complet : donnees numeriques + screenshot viewport.
+def audit_zone_full(zone_name, x_min, x_max, cx=None, cy=0, z=170, yaw=180):
+    """Audit complet : donnees numeriques + screenshot FIABLE.
 
-    1. audit_zone()              => rapport numerique (lumieres, props, ennemis)
-    2. take_viewport_screenshot() => screenshot pour analyse visuelle par Claude
+    CORRIGE le 2026-07-08 : utilisait take_viewport_screenshot() (HighResShot console
+    command), la meme approche mise en file d'attente que l'ancien take_screenshot() de
+    ue5_utils.py -- deja documentee comme peu fiable en contexte agent MCP (image noire
+    ou perimee, voir CLAUDE.md "Screenshot fiable"). Ce fichier (horror_presets.py) n'avait
+    jamais ete recroise avec ce fix car il vit a part de ue5_utils.py/verify_level.py --
+    audit_zone_full() est reste sur l'ancienne methode pendant que le reste du pipeline
+    migrait vers capture_reference_screenshot(). Meme fonction desormais que verify_level.py
+    et le reste de la boucle QC -- capture synchrone, position de camera reproductible.
+
+    1. audit_zone()                    => rapport numerique (lumieres, props, ennemis)
+    2. capture_reference_screenshot()  => screenshot fiable pour analyse visuelle
 
     Utilisation :
         audit_zone_full("Zone1", 0, 1400, cx=700)
-        # => Apres execution, Claude Cowork lit le screenshot et complete l'analyse
+        # => Lire le screenshot retourne avec Read tool, ou le passer a Tools/qc_gate.py
+        #    pour un verdict numerique consolide (voir verify_level.verified_zone_build()).
     """
+    import re, time
+    from ue5_utils import capture_reference_screenshot
+
     print("--- AUDIT NUMERIQUE ---")
     report = audit_zone(zone_name, x_min, x_max, cx, cy)
 
-    print("\n--- SCREENSHOT VIEWPORT ---")
-    screenshot_path = take_viewport_screenshot(
-        "audit_{}_{}".format(zone_name.lower().replace(" ", "_"),
-                             int(__import__('time').time())))
+    if cx is None:
+        cx = (x_min + x_max) / 2
+
+    print("\n--- SCREENSHOT FIABLE (capture_reference_screenshot) ---")
+    safe_name = re.sub(r"[^A-Za-z0-9_]", "_", zone_name.lower())
+    screenshot_path = capture_reference_screenshot(
+        cx, cy, z, pitch=0, yaw=yaw, name="audit_{}_{}".format(safe_name, int(time.time()))
+    )
 
     print("\n--- INSTRUCTIONS POUR CLAUDE COWORK ---")
     print("Lire et analyser visuellement : " + screenshot_path)
@@ -1095,6 +1121,7 @@ def audit_zone_full(zone_name, x_min, x_max, cx=None, cy=0):
     print("  - Props groupes avec logique narrative (pas eparpilles)")
     print("  - Ennemi partiellement cache (pas au centre)")
     print("  - Couleur dominante coherente (pas rouge partout)")
+    print("Ou lancer Tools/qc_gate.py sur ce screenshot pour un verdict numerique consolide.")
 
     return {"report": report, "screenshot": screenshot_path}
 
@@ -1656,15 +1683,19 @@ def setup_horror_corridor_full(x1, x2, cy=0, width=500,
 # l'application de fix_all()/run_verify() à la fin sont automatiques.
 # ══════════════════════════════════════════════════════════════════════════════
 
-def execute_level_plan(plan, start_x=0, cy=0, gap=100, verify_at_end=True):
+def execute_level_plan(plan, start_x=0, cy=0, gap=100, verify_at_end=True,
+                        use_verified_build=True, max_passes=3):
     """Exécute une séquence de salles/couloirs définie par un plan JSON.
 
     plan : liste de dicts, chacun un de deux types :
       {"type": "room", "zone_name": str, "style": str,
        "size_x": int, "size_y": int (opt, def 1200), "height": int (opt, def 300),
-       "with_enemy": bool (opt), "with_props": bool (opt), "cy": int (opt, override Y)}
+       "with_enemy": bool (opt), "with_props": bool (opt), "cy": int (opt, override Y),
+       "max_passes": int (opt, override le défaut de la fonction pour cette zone),
+       "capture_pos": (x,y,z,pitch,yaw,roll) (opt, override la position de capture)}
       {"type": "corridor", "zone_name": str, "style": str,
-       "length": int, "width": int (opt, def 500), "cy": int (opt, override Y)}
+       "length": int, "width": int (opt, def 500), "cy": int (opt, override Y),
+       "max_passes": int (opt), "capture_pos": tuple (opt)}
 
     Les positions X sont calculées automatiquement en chaînant les éléments les uns
     après les autres le long de l'axe X, séparés de `gap` UU. cy=0 par défaut, mais
@@ -1672,6 +1703,22 @@ def execute_level_plan(plan, start_x=0, cy=0, gap=100, verify_at_end=True):
     embranchement) — dans ce cas la suite du plan repart de la dernière position X
     utilisée, pas de la position Y (le chaînage reste 1D sur X, un plan en L ou en
     étoile nécessite plusieurs appels à execute_level_plan avec des start_x différents).
+
+    use_verified_build : si True (défaut, depuis 2026-07-08), chaque salle/couloir passe
+      par verify_level.verified_zone_build() — boucle fermée build -> fix_all() -> checks
+      structurels complets -> relance ciblée (setup_global_atmosphere si PostProcess/Lumen/
+      exposition mal calibrés, lumière de remplissage si couverture insuffisante) plafonnée
+      à `max_passes`, PUIS un screenshot fiable par zone (capture_reference_screenshot).
+      Remplace le comportement pré-2026-07-08 (fix_all()+run_verify() une seule fois, à la
+      toute fin du plan entier, sans relance et sans screenshot par zone). Rester sur
+      False pour retrouver l'ancien comportement (itération rapide sur un plan jetable,
+      sans le coût des passes supplémentaires ni des screenshots).
+      NOTE : verified_zone_build() ne clôt QUE le structurel — la lecture du/des
+      screenshot(s) retourné(s) avec Read (+ éventuellement Tools/qc_gate.py côté Claude
+      Cowork) reste une étape obligatoire séparée, jamais sautée, avant de déclarer une
+      zone terminée (voir CLAUDE.md section "BOUCLE QC FERMÉE").
+    max_passes : plafond de relance auto-correctrice par zone quand use_verified_build=True
+      (voir verified_zone_build). Peut être surchargé par zone via step["max_passes"].
 
     Exemple :
         plan = [
@@ -1686,45 +1733,96 @@ def execute_level_plan(plan, start_x=0, cy=0, gap=100, verify_at_end=True):
         ]
         execute_level_plan(plan, start_x=0)
 
-    Retourne un dict {"reports": [...], "final_x": ..., "verify_ok": bool|None}.
+    Retourne un dict {"reports": [...], "final_x": ..., "verify_ok": bool|None,
+      "screenshots": [...]}. "reports[i]['report']" est le dict verified_zone_build()
+      ({"zone_name","errors","warnings","screenshot","passes","structural_pass"}) si
+      use_verified_build=True, ou la string rapport de setup_horror_room()/
+      setup_horror_corridor_full() sinon (comportement pré-2026-07-08 inchangé).
+      "screenshots" liste tous les screenshots par zone (vide si use_verified_build=False).
     """
     x = start_x
     reports = []
+    screenshots = []
+
+    verified_zone_build = None
+    if use_verified_build:
+        from verify_level import verified_zone_build as _vzb
+        verified_zone_build = _vzb
 
     for i, step in enumerate(plan):
         step_type = step.get("type", "room")
         zone_name = step.get("zone_name", f"Zone_{i}")
         style = step.get("style", "silent_hill")
         step_cy = step.get("cy", cy)
+        step_max_passes = step.get("max_passes", max_passes)
+        step_capture_pos = step.get("capture_pos")
 
         if step_type == "room":
             size_x = step.get("size_x", 1200)
             size_y = step.get("size_y", 1200)
             height = step.get("height", 300)
             cx = x + size_x / 2
-            rapport = setup_horror_room(
-                style=style, zone_name=zone_name, cx=cx, cy=step_cy,
-                size_x=size_x, size_y=size_y, height=height,
-                with_enemy=step.get("with_enemy", True),
-                with_props=step.get("with_props", True),
-                with_gameplay=step.get("with_gameplay", True),
-            )
+            x_min, x_max = x, x + size_x
+
+            def build_fn(cx=cx, style=style, zone_name=zone_name, step_cy=step_cy,
+                         size_x=size_x, size_y=size_y, height=height, step=step):
+                return setup_horror_room(
+                    style=style, zone_name=zone_name, cx=cx, cy=step_cy,
+                    size_x=size_x, size_y=size_y, height=height,
+                    with_enemy=step.get("with_enemy", True),
+                    with_props=step.get("with_props", True),
+                    with_gameplay=step.get("with_gameplay", True),
+                )
+
+            if use_verified_build:
+                zresult = verified_zone_build(
+                    build_fn, zone_name, x_min=x_min, x_max=x_max, cx=cx, cy=step_cy,
+                    style=style, max_passes=step_max_passes, capture_pos=step_capture_pos,
+                )
+                if zresult.get("screenshot"):
+                    screenshots.append(zresult["screenshot"])
+            else:
+                zresult = build_fn()
             reports.append({"zone_name": zone_name, "type": "room", "cx": cx, "cy": step_cy,
-                            "report": rapport})
+                            "report": zresult})
             x = cx + size_x / 2 + gap
 
         elif step_type == "corridor":
             length = step.get("length", 800)
             width = step.get("width", 500)
             x1, x2 = x, x + length
-            rapport = setup_horror_corridor_full(x1, x2, cy=step_cy, width=width, style=style)
+            cx = (x1 + x2) / 2
+
+            def build_fn(x1=x1, x2=x2, step_cy=step_cy, width=width, style=style):
+                return setup_horror_corridor_full(x1, x2, cy=step_cy, width=width, style=style)
+
+            if use_verified_build:
+                zresult = verified_zone_build(
+                    build_fn, zone_name, x_min=x1, x_max=x2, cx=cx, cy=step_cy,
+                    style=style, max_passes=step_max_passes, capture_pos=step_capture_pos,
+                )
+                if zresult.get("screenshot"):
+                    screenshots.append(zresult["screenshot"])
+            else:
+                zresult = build_fn()
             reports.append({"zone_name": zone_name, "type": "corridor", "x1": x1, "x2": x2,
-                            "report": rapport})
+                            "report": zresult})
             x = x2 + gap
 
         else:
             reports.append({"zone_name": zone_name, "type": step_type,
                             "report": f"❌ Type inconnu: '{step_type}' (attendu: room, corridor)"})
+            continue
+
+        # verified_zone_build() ne sauvegarde jamais lui-même (voir sa docstring) — sans ce
+        # save() explicite, les corrections appliquées APRÈS la 1ère passe (atmosphère
+        # relancée, lumière de remplissage) ne seraient jamais persistées sur disque tant
+        # qu'aucun save() séparé n'est fait, au même titre que la leçon [2026-07-03 sexies]
+        # de GAME_MEMORY.md (mémoire et disque = deux états distincts).
+        try:
+            save()
+        except Exception as e:
+            print(f"[execute_level_plan] save() après zone '{zone_name}' a échoué: {e}")
 
     verify_ok = None
     if verify_at_end:
@@ -1732,14 +1830,18 @@ def execute_level_plan(plan, start_x=0, cy=0, gap=100, verify_at_end=True):
             from verify_level import fix_all, run_verify
             fix_all()
             verify_ok = run_verify()
+            save()
         except Exception as e:
             print(f"[execute_level_plan] Vérification finale échouée: {e}")
 
     print(f"\n=== execute_level_plan terminé — {len(plan)} élément(s), X final={x} ===")
     if verify_at_end:
         print(f"Vérification finale: {'JOUABLE ✅' if verify_ok else 'ERREURS DÉTECTÉES ❌'}")
+    if use_verified_build:
+        print(f"[execute_level_plan] {len(screenshots)} screenshot(s) par zone à Read AVANT "
+              f"de déclarer le plan terminé — voir CLAUDE.md 'BOUCLE QC FERMÉE'.")
 
-    return {"reports": reports, "final_x": x, "verify_ok": verify_ok}
+    return {"reports": reports, "final_x": x, "verify_ok": verify_ok, "screenshots": screenshots}
 
 
 def fix_existing_level(style="silent_hill"):
