@@ -1,6 +1,6 @@
 # UE5 Agent-Verified Level Generation
 
-[![CI](https://github.com/SethDrakor/ue5-agent-verified-levelgen/actions/workflows/ci.yml/badge.svg)](https://github.com/SethDrakor/ue5-agent-verified-levelgen/actions/workflows/ci.yml)
+[![CI](https://github.com/ThomasLabetouille/ue5-agent-verified-levelgen/actions/workflows/ci.yml/badge.svg)](https://github.com/ThomasLabetouille/ue5-agent-verified-levelgen/actions/workflows/ci.yml)
 
 **A C++/Python toolchain that lets an AI agent drive the Unreal Engine 5 editor
 reliably: procedural geometry generation, scripted Blueprint editing, and
