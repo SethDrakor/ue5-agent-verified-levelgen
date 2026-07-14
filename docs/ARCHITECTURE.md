@@ -35,6 +35,22 @@ Python interpreter directly. Both ultimately execute Python inside
   small plan executor (`execute_level_plan`) that chains rooms and corridors
   along an axis from a structured JSON plan.
 
+**Standalone QA/CI tooling (`Tools/`, ~800 lines, run outside the editor).**
+- `analyze_screenshot.py` — numeric perceptual check on an exported
+  screenshot (mean luminance, % of near-black pixels, brightest-point
+  position) using PIL/numpy, which the embedded UE5 Python interpreter
+  doesn't have.
+- `qc_gate.py` — merges `verify_level.py`'s structural report with
+  `analyze_screenshot.py`'s numeric read into one PASS/FAIL verdict per
+  zone, and maintains a persistent manifest (`Saved/QC/qc_manifest.json`)
+  tracking, per zone, whether it has ever had both a passing verdict *and*
+  a human/vision confirmation that the screenshot was actually looked at —
+  closing the gap where a structurally clean zone could still be declared
+  "done" without anyone having looked at it.
+- `visual_diff.py` — SSIM-based visual regression against a promoted
+  per-zone baseline screenshot (see the README for the reliability
+  rationale).
+
 ## The placement problem, in three layers
 
 Naively spawning an actor at a chosen (x, y) coordinate risks it landing

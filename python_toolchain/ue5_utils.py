@@ -1076,25 +1076,199 @@ def retry_step(step_name, corrected_code, previous_results, shared_ctx=None):
     return result
 
 
+# ══════════════════════════════════════════════════════
+# GARDE-FOU D'INTÉGRITÉ FICHIER — Content/Python/ réel
+# ══════════════════════════════════════════════════════
+#
+# Deux fois documenté dans GAME_MEMORY.md (sessions 15-16) : le pont
+# Windows↔sandbox Linux de Claude Cowork a corrompu silencieusement des
+# fichiers de ce projet — une fois avec des octets NUL de padding en fin de
+# fichier après un edit qui raccourcit, une autre fois avec une troncature
+# mi-instruction — sans qu'aucun outil ne lève d'erreur au moment de l'écriture.
+# `check_repo_integrity.py` (repo public ue5-agent-verified-levelgen) protège
+# déjà la copie de vitrine avec ce même principe (aucun octet NUL, ast.parse
+# valide) mais ne tourne QUE sur cette copie — jamais sur les fichiers réels
+# de Content/Python/ que le jeu charge réellement. Ce qui suit ferme ce trou
+# ici, côté fichiers réels, et est branché automatiquement dans safe_write()/
+# safe_append() plutôt que de dépendre d'un commit git ou d'une relecture
+# manuelle.
+
+# Fichiers legacy avec une incompatibilite Python <3.12 preexistante
+# (backslash dans la partie expression d'un f-string — invalide avant 3.12,
+# et l'interpreteur embarque dans UE5.7 est < 3.12), decouverte PAR ce
+# garde-fou lui-meme le jour de sa creation, sans aucun rapport avec de la
+# corruption : blueprint_modifier.py / paste_helpers.py sont des scripts
+# manuels de generation de T3D a coller dans l'editeur de graphe (workflow
+# pre-BatchWireGraph/BPGraph, confirme non importes par le reste du pipeline
+# actuel via grep). Une partie des occurrences a ete corrigee (variables
+# pre-quotees), le reste est une toile de guillemets imbriques trop dense
+# pour une correction mecanique sans risque — voir GAME_MEMORY.md pour la
+# decision (reecrire completement ou supprimer, non tranchee a ce jour).
+# Exemptes UNIQUEMENT du check ast.parse ci-dessous ; le check NUL bytes
+# (le vrai signal de corruption) reste actif dessus comme sur tout le reste.
+# Ne jamais ajouter un fichier ici pour faire taire un vrai probleme sans
+# une raison documentee equivalente.
+_INTEGRITY_PARSE_EXEMPT = {"blueprint_modifier.py", "paste_helpers.py"}
+
+
+def verify_file_integrity(path, expected_text=None, check_parse=True):
+    """Vérifie qu'un fichier écrit sur disque n'est pas silencieusement
+    corrompu. Lit TOUJOURS en binaire (jamais en mode texte) pour ne rater
+    aucun octet NUL — un f.read() en mode texte laisse passer un octet NUL
+    au milieu d'une chaîne sans lever d'erreur, ce qui a fait rater ce bug
+    par le passé.
+
+    Vérifie, dans l'ordre :
+      1. Absence totale d'octets NUL (signature de troncature/padding corrompu).
+      2. Si expected_text est fourni : égalité EXACTE caractère par caractère
+         avec le contenu attendu (pas une heuristique de taille approximative).
+      3. Si le chemin finit en .py ET check_parse=True : le contenu parse
+         comme Python valide (ast.parse) — attrape aussi les troncatures
+         mi-instruction qui laissent un fichier syntaxiquement invalide même
+         sans octet NUL. check_parse=False sert uniquement à l'exemption
+         documentée ci-dessus (_INTEGRITY_PARSE_EXEMPT) — ne pas l'utiliser
+         ailleurs sans la même justification écrite.
+
+    Ne lève jamais d'exception elle-même — retourne (True, "") ou
+    (False, message). C'est à l'appelant (safe_write/safe_append, ou un audit
+    manuel) de décider si l'échec doit être bloquant.
+    """
+    import os
+    if not os.path.isfile(path):
+        return False, "fichier introuvable: {}".format(path)
+
+    data = open(path, "rb").read()
+
+    if b"\x00" in data:
+        count = data.count(b"\x00")
+        first = data.index(b"\x00")
+        return False, "{} octet(s) NUL trouve(s) (premier a l'offset {}) — fichier probablement tronque/corrompu".format(count, first)
+
+    try:
+        actual_text = data.decode("utf-8")
+    except UnicodeDecodeError as e:
+        return False, "decode UTF-8 echoue: {}".format(e)
+
+    if expected_text is not None:
+        # Comparaison sur texte normalise (\r\n -> \n) : open(path,"w") en
+        # mode texte traduit chaque "\n" ecrit en "\r\n" sur Windows (universal
+        # newlines), donc une lecture binaire brute ne matchera JAMAIS un
+        # expected_text ecrit avec de simples "\n" — decouvert en testant cette
+        # fonction elle-meme (safe_write levait une Exception sur CHAQUE
+        # ecriture). Ce n'est pas de la corruption, juste la traduction normale
+        # de fin de ligne ; on la neutralise avant de comparer. Le check NUL
+        # bytes plus haut, lui, reste sur les octets bruts et n'est pas affecte.
+        actual_normalized = actual_text.replace("\r\n", "\n")
+        expected_normalized = expected_text.replace("\r\n", "\n")
+        if actual_normalized != expected_normalized:
+            m = min(len(actual_normalized), len(expected_normalized))
+            i = 0
+            while i < m and actual_normalized[i] == expected_normalized[i]:
+                i += 1
+            return False, "contenu different de l'attendu a partir du caractere {} (attendu {} chars, obtenu {} chars, fins de ligne normalisees)".format(
+                i, len(expected_normalized), len(actual_normalized))
+
+    if path.endswith(".py") and check_parse:
+        import ast
+        try:
+            ast.parse(actual_text, filename=path)
+        except (SyntaxError, ValueError) as e:
+            return False, "ne parse pas comme Python valide: {}".format(e)
+
+    return True, ""
+
+
+def scan_content_python_integrity(verbose=True):
+    """Audit d'intégrité de TOUS les .py de Content/Python/ — équivalent, pour
+    les fichiers RÉELS utilisés par le jeu, de check_repo_integrity.py qui ne
+    protège que la copie de vitrine du repo public. À lancer en début/fin de
+    session, ou après tout doute (édition suspecte, sync, crash, relecture
+    du shell sandbox qui semble différer de ce que montre l'outil de lecture).
+
+    Les fichiers listés dans _INTEGRITY_PARSE_EXEMPT restent vérifiés pour les
+    octets NUL (le vrai signal de corruption) mais pas pour le parsing Python
+    — un souci de syntaxe déjà connu et documenté chez eux est loggé à part
+    en warning, sans faire échouer l'audit ni les tests de régression.
+
+    Retourne la liste des (path, message) en échec bloquant — liste vide =
+    tout sain (les warnings des fichiers exemptés n'y figurent pas).
+    """
+    import os, glob
+    d = os.path.dirname(os.path.abspath(__file__))
+    problems = []
+    warnings = []
+    all_py = sorted(glob.glob(os.path.join(d, "*.py")))
+    for f in all_py:
+        base = os.path.basename(f)
+        exempt = base in _INTEGRITY_PARSE_EXEMPT
+        ok, msg = verify_file_integrity(f, check_parse=not exempt)
+        if not ok:
+            problems.append((f, msg))
+        elif exempt:
+            # NUL/decode OK, mais on sait que le parsing échoue — le confirmer
+            # explicitement et le logger en warning plutôt que de le taire.
+            parse_ok, parse_msg = verify_file_integrity(f, check_parse=True)
+            if not parse_ok:
+                warnings.append((f, parse_msg))
+    if verbose:
+        if problems:
+            unreal.log_error("[INTEGRITY] {} probleme(s) trouve(s) dans Content/Python/ :".format(len(problems)))
+            for f, msg in problems:
+                unreal.log_error("  - {}: {}".format(os.path.basename(f), msg))
+        else:
+            unreal.log("[INTEGRITY] OK — tous les .py de Content/Python/ sont sains ({} fichiers)".format(len(all_py)))
+        for f, msg in warnings:
+            unreal.log("[INTEGRITY][warning connu, non bloquant] {}: {}".format(os.path.basename(f), msg))
+    return problems
+
+
 def safe_write(path, content, must_contain=None):
-    """Ecrit un fichier et verifie immediatement que le contenu est correct.
-    Leve une Exception si ecriture ratee ou token attendu absent.
+    """Ecrit un fichier de facon ATOMIQUE et verifie le contenu AVANT de toucher
+    le fichier final. Leve une Exception si ecriture ratee, token attendu absent,
+    OU si verify_file_integrity() detecte une corruption (octets NUL, contenu
+    different de l'attendu, syntaxe Python invalide) — voir section
+    "GARDE-FOU D'INTÉGRITÉ FICHIER" plus haut pour le bug que ceci ferme.
+
+    Ecriture atomique (ajoute 2026-07-08) : le contenu est d'abord ecrit dans un
+    fichier temporaire (meme dossier => meme systeme de fichiers), verifie
+    integralement, et SEULEMENT si la verification passe, bascule sur le fichier
+    final via os.replace() (atomique sous Windows et POSIX). Avant ce changement,
+    l'ecriture visait DIRECTEMENT le fichier final puis verifiait apres coup : si
+    l'ecriture elle-meme etait corrompue par le pont Windows<->sandbox Linux de
+    Cowork (NUL de padding, troncature — voir CLAUDE.md sessions 15-16), le
+    fichier corrompu passait un instant reel sur disque, a l'emplacement que UE5
+    charge, avant que l'Exception ne soit levee. Avec l'ecriture atomique, une
+    ecriture ratee ne touche JAMAIS le fichier final : le pire cas est un fichier
+    .tmp orphelin nettoye dans le finally, jamais une corruption du vrai fichier.
+
     Usage: safe_write(path, content, must_contain=["BatchWireGraph","FindPinByName"])
     """
     import os
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(content)
-    with open(path, encoding="utf-8") as f:
-        written = f.read()
-    if len(written) < len(content) * 0.9:
-        raise Exception("safe_write ECHEC taille: attendu ~{} chars, ecrit {} dans {}".format(
-            len(content), len(written), path))
-    if must_contain:
-        for needle in (must_contain if isinstance(must_contain, list) else [must_contain]):
-            if needle not in written:
-                raise Exception("safe_write ECHEC: '{}' manquant dans {}".format(needle, path))
-    unreal.log("[safe_write] OK {} ({} chars)".format(os.path.basename(path), len(written)))
-    return len(written)
+
+    tmp_path = "{}.tmp_safewrite_{}".format(path, os.getpid())
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            f.write(content)
+
+        ok, msg = verify_file_integrity(tmp_path, expected_text=content)
+        if not ok:
+            raise Exception("safe_write ECHEC integrite (fichier final NON touche) dans {}: {}".format(path, msg))
+
+        if must_contain:
+            for needle in (must_contain if isinstance(must_contain, list) else [must_contain]):
+                if needle not in content:
+                    raise Exception("safe_write ECHEC (fichier final NON touche): '{}' manquant dans {}".format(needle, path))
+
+        os.replace(tmp_path, path)
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
+    unreal.log("[safe_write] OK {} ({} chars, ecriture atomique + integrite verifiee octet par octet)".format(os.path.basename(path), len(content)))
+    return len(content)
 
 
 # ══════════════════════════════════════════════════════
@@ -1278,18 +1452,54 @@ def memory_snapshot():
 
 
 def safe_append(path, content, must_contain=None):
-    """Ajoute du contenu a un fichier et verifie. must_contain cherche dans le fichier entier."""
+    """Ajoute du contenu a un fichier de facon ATOMIQUE (ajoute 2026-07-08) et
+    verifie. must_contain cherche dans le fichier entier. Leve une Exception si
+    le contenu final ne se termine pas exactement par le contenu ajoute, ou si
+    verify_file_integrity() detecte une corruption (octets NUL, syntaxe Python
+    invalide) — voir section "GARDE-FOU D'INTÉGRITÉ FICHIER" plus haut.
+
+    Comme safe_write() : lit l'ancien contenu, construit le contenu final EN
+    MEMOIRE, l'ecrit dans un fichier temporaire, verifie integralement, et
+    bascule seulement ensuite via os.replace(). L'ancienne version faisait un
+    open(path, "a") en ecriture DIRECTE sur le fichier reel — exactement le
+    chemin qui a produit la corruption documentee (NUL de padding, CLAUDE.md
+    sessions 15-16) lors d'un edit qui modifie un fichier existant deja present
+    sur disque. Cette version ne touche jamais le fichier reel avant d'avoir
+    confirme que le contenu complet (ancien + nouveau) est sain."""
     import os
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(content)
+
     with open(path, encoding="utf-8") as f:
-        written = f.read()
-    if must_contain:
-        for needle in (must_contain if isinstance(must_contain, list) else [must_contain]):
-            if needle not in written:
-                raise Exception("safe_append ECHEC: '{}' manquant dans {}".format(needle, path))
-    unreal.log("[safe_append] OK {} ({} chars total)".format(os.path.basename(path), len(written)))
-    return len(written)
+        old_content = f.read()
+
+    new_content = old_content + content
+
+    if not new_content.endswith(content):
+        raise Exception("safe_append ECHEC: incoherence interne de concatenation pour {} (ne devrait jamais arriver)".format(path))
+
+    tmp_path = "{}.tmp_safeappend_{}".format(path, os.getpid())
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            f.write(new_content)
+
+        ok, msg = verify_file_integrity(tmp_path, expected_text=new_content)
+        if not ok:
+            raise Exception("safe_append ECHEC integrite (fichier final NON touche) dans {}: {}".format(path, msg))
+
+        if must_contain:
+            for needle in (must_contain if isinstance(must_contain, list) else [must_contain]):
+                if needle not in new_content:
+                    raise Exception("safe_append ECHEC (fichier final NON touche): '{}' manquant dans {}".format(needle, path))
+
+        os.replace(tmp_path, path)
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
+    unreal.log("[safe_append] OK {} ({} chars total, ecriture atomique + integrite verifiee)".format(os.path.basename(path), len(new_content)))
+    return len(new_content)
 
 
 # ══════════════════════════════════════════════════════

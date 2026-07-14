@@ -13,10 +13,9 @@ Contient :
 
 import unreal
 import random
-from ue5_utils import (aeas, spawn, point_light, place_static_mesh,
+from ue5_utils import (aeas, point_light, place_static_mesh,
                        scatter_props, tag_actor, save,
-                       build_occupancy_grid_from_level, safe_spawn_enemy,
-                       actor_by_label, all_actors)
+                       build_occupancy_grid_from_level, safe_spawn_enemy)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -693,7 +692,6 @@ def apply_material_to_zone(x_min, x_max, style="silent_hill",
         apply_material_to_zone(0, 1400, style="silent_hill")
     """
     preset = WALL_PRESETS.get(style, WALL_PRESETS["silent_hill"])
-    zone_tag = "z{}_".format(int((x_min + x_max) / 2 / 1400) + 1)
 
     # Creer les instances si pas de custom
     mi_wall  = custom_wall  or create_material_instance(
@@ -1734,15 +1732,25 @@ def execute_level_plan(plan, start_x=0, cy=0, gap=100, verify_at_end=True,
         execute_level_plan(plan, start_x=0)
 
     Retourne un dict {"reports": [...], "final_x": ..., "verify_ok": bool|None,
-      "screenshots": [...]}. "reports[i]['report']" est le dict verified_zone_build()
-      ({"zone_name","errors","warnings","screenshot","passes","structural_pass"}) si
+      "screenshots": [...], "qc_pending": [...]}. "reports[i]['report']" est le dict
+      verified_zone_build()
+      ({"zone_name","errors","warnings","screenshot","passes","structural_pass","qc_manifest"}) si
       use_verified_build=True, ou la string rapport de setup_horror_room()/
       setup_horror_corridor_full() sinon (comportement pré-2026-07-08 inchangé).
       "screenshots" liste tous les screenshots par zone (vide si use_verified_build=False).
+
+      "qc_pending" (ajouté 2026-07-08) : liste des zones de CE plan qui n'ont pas encore
+      (qc_gate PASS + lecture visuelle confirmée) dans Saved/QC/qc_manifest.json — audit
+      automatique via verify_level.check_qc_pending(), voir CLAUDE.md "BOUCLE QC FERMÉE".
+      Vide si use_verified_build=False (le manifest n'existe que pour les zones passées
+      par verified_zone_build()). NE REMPLACE PAS l'obligation de lancer réellement
+      Tools/qc_gate.py --zone et --confirm-visual-read côté Cowork pour chaque zone listée
+      ici — ça rend juste l'oubli visible dans le retour de la fonction plutôt que silencieux.
     """
     x = start_x
     reports = []
     screenshots = []
+    built_zone_names = []
 
     verified_zone_build = None
     if use_verified_build:
@@ -1781,6 +1789,7 @@ def execute_level_plan(plan, start_x=0, cy=0, gap=100, verify_at_end=True,
                 )
                 if zresult.get("screenshot"):
                     screenshots.append(zresult["screenshot"])
+                built_zone_names.append(zone_name)
             else:
                 zresult = build_fn()
             reports.append({"zone_name": zone_name, "type": "room", "cx": cx, "cy": step_cy,
@@ -1803,6 +1812,7 @@ def execute_level_plan(plan, start_x=0, cy=0, gap=100, verify_at_end=True,
                 )
                 if zresult.get("screenshot"):
                     screenshots.append(zresult["screenshot"])
+                built_zone_names.append(zone_name)
             else:
                 zresult = build_fn()
             reports.append({"zone_name": zone_name, "type": "corridor", "x1": x1, "x2": x2,
@@ -1834,14 +1844,45 @@ def execute_level_plan(plan, start_x=0, cy=0, gap=100, verify_at_end=True,
         except Exception as e:
             print(f"[execute_level_plan] Vérification finale échouée: {e}")
 
+    # Audit automatique du manifest QC (ajouté 2026-07-08, suite au fix du point critique
+    # #2) : jusqu'ici, savoir si qc_gate.py + la lecture visuelle avaient réellement eu
+    # lieu demandait un appel manuel séparé (`python3 Tools/qc_gate.py --check-manifest`,
+    # côté Cowork bash) que rien ne forçait à lancer. check_qc_pending() lit le MÊME
+    # manifest en pur stdlib (aucun besoin de PIL/numpy pour ÇA -- seule l'analyse de
+    # pixels en a besoin et reste donc, elle, côté Cowork bash) : ça ne remplace PAS
+    # qc_gate.py --zone (verdict numérique) ni la lecture humaine/vision du screenshot,
+    # mais ça rend impossible de ne pas savoir, à la fin même de execute_level_plan(),
+    # quelles zones n'ont jamais reçu cette vérification.
+    qc_pending = []
+    if use_verified_build and built_zone_names:
+        try:
+            from verify_level import check_qc_pending
+            qc_pending = check_qc_pending(built_zone_names)
+        except Exception as e:
+            print(f"[execute_level_plan] check_qc_pending() a échoué: {e}")
+
     print(f"\n=== execute_level_plan terminé — {len(plan)} élément(s), X final={x} ===")
     if verify_at_end:
         print(f"Vérification finale: {'JOUABLE ✅' if verify_ok else 'ERREURS DÉTECTÉES ❌'}")
     if use_verified_build:
         print(f"[execute_level_plan] {len(screenshots)} screenshot(s) par zone à Read AVANT "
               f"de déclarer le plan terminé — voir CLAUDE.md 'BOUCLE QC FERMÉE'.")
+        if qc_pending:
+            print(f"[execute_level_plan] ⚠ {len(qc_pending)}/{len(built_zone_names)} zone(s) "
+                  f"PAS ENCORE complètement vérifiée(s) (qc_gate PASS + lecture visuelle) :")
+            for p in qc_pending:
+                print(f"   - {p['zone']}: {', '.join(p['reasons'])}")
+            print("[execute_level_plan] ÉTAPE OBLIGATOIRE (Claude Cowork, jamais le panneau "
+                  "in-editor) : Read(screenshot) puis "
+                  "'python3 Tools/qc_gate.py --screenshots <png> --zone <nom>' puis "
+                  "'python3 Tools/qc_gate.py --confirm-visual-read <nom>' pour chaque zone "
+                  "listée ci-dessus.")
+        else:
+            print(f"[execute_level_plan] ✅ {len(built_zone_names)} zone(s) déjà marquée(s) "
+                  f"qc_gate PASS + lecture visuelle confirmée dans le manifest QC.")
 
-    return {"reports": reports, "final_x": x, "verify_ok": verify_ok, "screenshots": screenshots}
+    return {"reports": reports, "final_x": x, "verify_ok": verify_ok, "screenshots": screenshots,
+            "qc_pending": qc_pending}
 
 
 def fix_existing_level(style="silent_hill"):

@@ -2,7 +2,7 @@
 
 This repo has no access to a UE5 Editor, so CI cannot run the real
 verification workflow that matters most for this project — the in-editor
-`test_suite.py` (45 tests against the live plugin) and `verify_level.py`
+`test_suite.py` (81 tests against the live plugin) and `verify_level.py`
 (collision/NavMesh/gameplay checks against a live level). Standing up a
 licensed Unreal Engine install in a public GitHub Actions runner isn't
 practical (size, licensing, minutes) and would be theater more than signal:
@@ -46,15 +46,24 @@ catching real bugs, not about a particular formatting taste.
 
 ## What it deliberately does not check
 
-No C++ compilation. No Blueprint compilation. No PIE run. No screenshot
-comparison. No NavMesh build. Those all require a licensed Unreal Engine
-install, which this CI does not and — realistically, given free-tier GitHub
-Actions minutes and Epic's engine distribution terms — should not attempt.
-The in-editor `test_suite.py` (45 tests, run manually before/after any
-plugin change, see `docs/ARCHITECTURE.md`) remains the real safety net for
-anything that touches the C++ subsystems or Blueprint graphs. CI here is a
-second, narrower net underneath it — for the class of bug that doesn't need
-an editor to catch, and that nothing was catching before.
+No C++ compilation. No Blueprint compilation. No PIE run. No pixel-level
+screenshot comparison (see below), no NavMesh build. Those all require a
+licensed Unreal Engine install, which this CI does not and — realistically,
+given free-tier GitHub Actions minutes and Epic's engine distribution terms —
+should not attempt. The in-editor `test_suite.py` (81 tests, run
+automatically before/after any plugin change via `safe_modify_plugin()`, see
+`docs/ARCHITECTURE.md`) remains the real safety net for anything that
+touches the C++ subsystems or Blueprint graphs. CI here is a second,
+narrower net underneath it — for the class of bug that doesn't need an
+editor to catch, and that nothing was catching before.
+
+Screenshot-based visual regression (`Tools/visual_diff.py`, SSIM against a
+per-zone baseline — see the README) is deliberately not wired into this
+GitHub Actions workflow either: it needs PIL/numpy, which aren't installed
+here, and more importantly it needs a *screenshot from the live editor* to
+compare against — there's nothing to diff without a UE5 session in the loop.
+It runs the same way `test_suite.py` does: manually, alongside the agent
+session that's actually driving the editor.
 
 ## Running these checks before you even commit
 

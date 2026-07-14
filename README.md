@@ -80,14 +80,23 @@ workflows. `capture_reference_screenshot()` uses a `SceneCaptureComponent2D`
 with a synchronous `capture_scene()` call instead, at a camera position the
 agent chooses deliberately.
 
+**Visual regression, not just structural pass/fail.** A level can pass every
+structural check (no overlaps, no missing floor, correct tags) and still look
+wrong — a moved light, a swapped material, a prop dropped by a refactor.
+`Tools/visual_diff.py` promotes a verified-good screenshot to a per-zone
+baseline and compares future rebuilds against it with a block-based SSIM
+approximation in plain numpy (no `scikit-image` dependency). A low similarity
+score doesn't auto-fail anything — it's a flag that something changed,
+surfaced for a human/vision read rather than silently missed.
+
 ## Numbers
 
 | | |
 |---|---|
-| C++ (plugin) | ~2,000 lines |
-| Python toolchain | ~4,500 lines |
-| Automated tests | 45 (plugin anti-regression + level verification) |
-| Undocumented UE5.7 API quirks identified and worked around | 15+ |
+| C++ (plugin) | ~1,850 lines |
+| Python toolchain | ~5,800 lines (+ ~800 lines of standalone QA/CI tooling in `Tools/`) |
+| Automated tests | 81 in-editor (`test_suite.py`, run before/after any plugin change) + 9 editor-independent (`pytest`, this repo's CI) |
+| Undocumented UE5.7 API quirks identified and worked around | 19 (see `docs/KNOWN_ISSUES.md`) |
 
 ## Stack
 
@@ -103,14 +112,17 @@ generation or Blueprint editing.
 
 ## Proof, not just claims
 
-`run_verify()` on the actual project level — 11 automated checks, screenshot
+`run_verify()` on the actual project level — automated checks, screenshot
 included, before a single `save()` is allowed to happen:
 
 ![run_verify() passing](media/run_verify_passing.png)
 
-The anti-regression suite for the plugin and Python toolchain, 45/45:
+The anti-regression suite for the plugin and Python toolchain (baseline
+capture below is from an earlier pass at 45/45 — the suite has grown since,
+see the Numbers table above for the current count; same suite, same
+before/after diff logic):
 
-![test_suite 45/45](media/test_suite_45_45.png)
+![test_suite passing](media/test_suite_45_45.png)
 
 ---
 

@@ -769,6 +769,178 @@ def test_bake_lighting_mobility():
 
 
 # ─────────────────────────────────────────────────────────────
+# Garde-fou d'integrite fichier (verify_file_integrity / scan_content_python_integrity)
+# Ajoute en reponse au bug de corruption silencieuse documente dans
+# GAME_MEMORY.md sessions 15-16 (padding NUL / troncature sans erreur sur le
+# pont Windows<->sandbox Linux de Claude Cowork). Fichiers de test ecrits
+# dans Saved/Temp/, jamais dans Content/, nettoyage garanti par try/finally.
+# ─────────────────────────────────────────────────────────────
+
+def _test_file_integrity_guard():
+    try:
+        from ue5_utils import verify_file_integrity, scan_content_python_integrity
+    except Exception as e:
+        _results.append((_FAIL, "integrity import", str(e)))
+        return
+
+    import os
+    tmp_dir = os.path.join(unreal.Paths.project_saved_dir(), "Temp", "IntegrityTests")
+    os.makedirs(tmp_dir, exist_ok=True)
+
+    ok_path = os.path.join(tmp_dir, "_ts_ok_file.py")
+    nul_path = os.path.join(tmp_dir, "_ts_nul_file.py")
+    bad_syntax_path = os.path.join(tmp_dir, "_ts_bad_syntax.py")
+
+    try:
+        with open(ok_path, "w", encoding="utf-8") as f:
+            f.write("x = 1\n")
+        _test("integrity - fichier Python valide -> OK",
+              lambda: verify_file_integrity(ok_path)[0] is True)
+
+        with open(nul_path, "wb") as f:
+            f.write(b"x = 1\n" + b"\x00" * 20)
+        _test("integrity - detecte le padding NUL (bug sessions 15-16)",
+              lambda: verify_file_integrity(nul_path)[0] is False)
+
+        with open(bad_syntax_path, "w", encoding="utf-8") as f:
+            f.write("def foo(:\n    pass")
+        _test("integrity - detecte une syntaxe Python invalide (troncature)",
+              lambda: verify_file_integrity(bad_syntax_path)[0] is False)
+
+        _test("integrity - detecte un contenu different de l'attendu",
+              lambda: verify_file_integrity(ok_path, expected_text="y = 2\n")[0] is False)
+
+        _test("integrity - scan_content_python_integrity propre sur les vrais fichiers du projet",
+              lambda: len(scan_content_python_integrity(verbose=False)) == 0)
+    finally:
+        for p in (ok_path, nul_path, bad_syntax_path):
+            try:
+                if os.path.exists(p):
+                    os.remove(p)
+            except Exception:
+                pass
+
+
+# ─────────────────────────────────────────────────────────────
+# Manifest QC persistant (verified_zone_build -> Saved/QC/qc_manifest.json)
+# Ajoute le 2026-07-08 en reponse au "point critique #2" (check_light_coverage()
+# peut passer alors que la salle est visuellement noire, et rien ne garantissait
+# que qc_gate.py + une lecture visuelle etaient reellement effectues avant de
+# declarer une zone terminee). Zone de test dediee, jamais utilisee par le vrai
+# level design, entree retiree du manifest reel dans le finally.
+# ─────────────────────────────────────────────────────────────
+
+def _test_qc_manifest():
+    try:
+        import verify_level as _vl
+    except Exception as e:
+        _results.append((_FAIL, "qc_manifest import", str(e)))
+        return
+
+    test_zone = "_TestSuite_QCZone"
+
+    try:
+        path = _vl._record_qc_pending(test_zone, "fake_screenshot.png", ["err1"], ["warn1"])
+        _test("qc_manifest - _record_qc_pending retourne un chemin existant",
+              lambda: os.path.isfile(path))
+
+        data = _vl._load_qc_manifest()
+        _test("qc_manifest - entree pending presente apres _record_qc_pending",
+              lambda: test_zone in data)
+        _test("qc_manifest - qc_gate_verdict initial est None (jamais verifie)",
+              lambda: data.get(test_zone, {}).get("qc_gate_verdict") is None)
+        _test("qc_manifest - visual_read_confirmed initial est False",
+              lambda: data.get(test_zone, {}).get("visual_read_confirmed") is False)
+        _test("qc_manifest - structural_errors bien enregistrees",
+              lambda: data.get(test_zone, {}).get("structural_errors") == ["err1"])
+
+        # Un nouvel appel doit ECRASER l'ancienne entree (nouveau screenshot =
+        # ancien verdict qc_gate invalide) plutot que de la fusionner
+        _vl._record_qc_pending(test_zone, "fake_screenshot_v2.png", [], [])
+        data2 = _vl._load_qc_manifest()
+        _test("qc_manifest - un nouveau build reinitialise qc_gate_verdict a None",
+              lambda: data2.get(test_zone, {}).get("qc_gate_verdict") is None)
+        _test("qc_manifest - un nouveau build remplace le screenshot precedent",
+              lambda: data2.get(test_zone, {}).get("screenshot") == "fake_screenshot_v2.png")
+    finally:
+        # Nettoyage : retirer l'entree de test du manifest reel (Saved/QC/qc_manifest.json
+        # peut contenir de vraies zones du level design, ne pas les toucher)
+        try:
+            data = _vl._load_qc_manifest()
+            if test_zone in data:
+                del data[test_zone]
+                import json
+                with open(_vl._qc_manifest_path(), "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
+
+
+def _test_check_qc_pending():
+    """check_qc_pending() -- audit stdlib du manifest QC, branche automatiquement dans
+    execute_level_plan() (session 2026-07-08, fix du point critique #2 v2 : rendre
+    l'audit automatique plutot qu'un appel manuel separe)."""
+    try:
+        import verify_level as _vl
+    except Exception as e:
+        _results.append((_FAIL, "check_qc_pending import", str(e)))
+        return
+
+    zone_complete = "_TestSuite_QC_Complete"
+    zone_no_gate = "_TestSuite_QC_NoGate"
+    zone_no_visual = "_TestSuite_QC_NoVisual"
+    test_zones = [zone_complete, zone_no_gate, zone_no_visual]
+
+    try:
+        # Zone complete : qc_gate PASS + lecture visuelle confirmee -> ne doit PAS apparaitre
+        _vl._record_qc_pending(zone_complete, "a.png", [], [])
+        data = _vl._load_qc_manifest()
+        data[zone_complete]["qc_gate_verdict"] = "PASS"
+        data[zone_complete]["visual_read_confirmed"] = True
+        import json
+        with open(_vl._qc_manifest_path(), "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+
+        # Zone jamais passee par qc_gate.py -> qc_gate_verdict reste None
+        _vl._record_qc_pending(zone_no_gate, "b.png", [], [])
+
+        # Zone verifiee numeriquement mais jamais lue visuellement
+        _vl._record_qc_pending(zone_no_visual, "c.png", [], [])
+        data = _vl._load_qc_manifest()
+        data[zone_no_visual]["qc_gate_verdict"] = "PASS"
+        with open(_vl._qc_manifest_path(), "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+
+        pending = _vl.check_qc_pending(test_zones)
+        pending_names = {p["zone"] for p in pending}
+
+        _test("check_qc_pending - zone complete absente du pending",
+              lambda: zone_complete not in pending_names)
+        _test("check_qc_pending - zone sans qc_gate presente dans le pending",
+              lambda: zone_no_gate in pending_names)
+        _test("check_qc_pending - zone sans lecture visuelle presente dans le pending",
+              lambda: zone_no_visual in pending_names)
+        _test("check_qc_pending - zone inconnue du manifest est aussi signalee",
+              lambda: len(_vl.check_qc_pending(["_TestSuite_QC_Inexistante"])) == 1)
+        _test("check_qc_pending - sans argument (toutes les zones), retrouve bien nos zones incompletes",
+              lambda: {zone_no_gate, zone_no_visual}.issubset({p["zone"] for p in _vl.check_qc_pending()}))
+    finally:
+        try:
+            data = _vl._load_qc_manifest()
+            changed = False
+            for z in test_zones:
+                if z in data:
+                    del data[z]
+                    changed = True
+            if changed:
+                import json
+                with open(_vl._qc_manifest_path(), "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
+
+
+# ─────────────────────────────────────────────────────────────
 # Point d'entree
 # ─────────────────────────────────────────────────────────────
 
@@ -799,6 +971,9 @@ def run_all(verbose=True):
     _test_capture_all_zones_screenshots()
     _test_check_materials_geometry_fallback()
     _test_capture_pipeline_selftest()
+    _test_file_integrity_guard()
+    _test_qc_manifest()
+    _test_check_qc_pending()
 
     passed = sum(1 for s, _, _ in _results if s == _OK)
     failed = sum(1 for s, _, _ in _results if s == _FAIL)

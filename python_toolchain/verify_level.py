@@ -236,7 +236,6 @@ def check_gameplay_completeness(actors):
 def check_duplicates(actors):
     """Détecte les acteurs dupliqués (PostProcess, PlayerStart, etc.)."""
     warnings = []
-    from collections import Counter
     pp_count = sum(1 for a in actors if "PostProcess" in a.get_actor_label())
     ps_count = sum(1 for a in actors if "PlayerStart" in a.get_class().get_name())
     if pp_count > 1:
@@ -269,7 +268,7 @@ def check_navmesh_rebuild(world):
             warnings.append("NAVMESH NON BUILTÉ: faire Build → Build Paths dans UE5 (menu Build en haut)")
         else:
             pass  # NavMesh OK, pas de warning
-    except Exception as e:
+    except Exception:
         # Fallback : vérifier juste que RecastNavMesh-Default existe
         has_recast = any("RecastNavMesh" in a.get_class().get_name()
                          for a in _actors())
@@ -667,7 +666,6 @@ def capture_all_zones_screenshots(name_prefix="verify_zone"):
     wall_boxes = [(lbl, o, e) for lbl, o, e in geo_boxes if "wall" in lbl.lower() or "mur" in lbl.lower()]
 
     zones_raw = _group_walls_by_zone(wall_boxes)
-    zones = {zk: [(o, e) for _, o, e in items] for zk, items in zones_raw.items()}
 
     paths = {}
     for zone_key, boxes in zones_raw.items():
@@ -800,7 +798,7 @@ def run_verify(take_screenshot=True, level_name=None):
 
     # Rapport final
     print(f"\n{'='*50}")
-    print(f"RAPPORT FINAL")
+    print("RAPPORT FINAL")
     print(f"{'='*50}")
 
     if all_errors:
@@ -808,21 +806,21 @@ def run_verify(take_screenshot=True, level_name=None):
         for e in all_errors:
             print(f"   • {e}")
     else:
-        print(f"\n✅ Aucune erreur bloquante")
+        print("\n✅ Aucune erreur bloquante")
 
     if all_warnings:
         print(f"\n⚠  WARNINGS ({len(all_warnings)}) — level jouable mais imparfait :")
         for w in all_warnings:
             print(f"   • {w}")
     else:
-        print(f"\n✅ Aucun warning")
+        print("\n✅ Aucun warning")
 
     if not all_errors and not all_warnings:
-        print(f"\n🎮 LEVEL PARFAITEMENT JOUABLE")
+        print("\n🎮 LEVEL PARFAITEMENT JOUABLE")
 
     if screenshot_path:
         print(f"\n📸 Screenshot: {screenshot_path}")
-        print(f"   (lire avec Read tool pour vérification visuelle)")
+        print("   (lire avec Read tool pour vérification visuelle)")
 
     playable = len(all_errors) == 0
     print(f"\n{'='*50}")
@@ -991,6 +989,100 @@ print("[verify_level] loaded — from verify_level import run_verify, fix_all")
 # qui consolide ce retour structurel avec l'analyse numerique de pixels en un seul verdict.
 # ══════════════════════════════════════════════════════
 
+def _qc_manifest_path():
+    """Chemin du manifest QC persistant (Saved/QC/qc_manifest.json) -- partagé entre
+    verified_zone_build() (côté UE5, écrit les entrées "pending") et Tools/qc_gate.py
+    (côté Cowork bash, met à jour verdict numérique + confirmation de lecture visuelle).
+    Saved/ est ignoré par git (état éphémère de build, pas une source)."""
+    import os
+    d = os.path.join(unreal.Paths.project_dir(), "Saved", "QC")
+    os.makedirs(d, exist_ok=True)
+    return os.path.join(d, "qc_manifest.json")
+
+
+def _load_qc_manifest():
+    import json, os
+    path = _qc_manifest_path()
+    if not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _record_qc_pending(zone_name, screenshot_path, errors, warnings):
+    """Enregistre dans le manifest QC qu'une zone vient d'être (re)construite et a un
+    screenshot frais qui attend encore Tools/qc_gate.py + une lecture visuelle confirmée
+    -- voir CLAUDE.md section "BOUCLE QC FERMÉE". Avant ce manifest, "ne jamais déclarer
+    terminé sans Read + qc_gate.py" n'était qu'un message imprimé -- rien n'empêchait un
+    agent pressé de l'ignorer silencieusement, exactement le même trou de conception que
+    celui fermé pour safe_write/safe_append (convention non vérifiable -> mécanisme
+    persistant et auditable). Écrase l'entrée précédente de cette zone : un nouveau
+    screenshot invalide l'ancien verdict qc_gate, qui ne s'appliquait qu'à l'ancienne image.
+    """
+    import json, datetime
+    data = _load_qc_manifest()
+    data[zone_name] = {
+        "zone_name": zone_name,
+        "screenshot": screenshot_path,
+        "structural_errors": list(errors),
+        "structural_warnings": list(warnings),
+        "built_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        "qc_gate_verdict": None,
+        "qc_gate_ran_at": None,
+        "visual_read_confirmed": False,
+        "visual_read_note": None,
+    }
+    path = _qc_manifest_path()
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+    return path
+
+
+def check_qc_pending(zone_names=None):
+    """Audit du manifest QC (Saved/QC/qc_manifest.json) -- liste les zones qui n'ont
+    PAS encore (qc_gate_verdict == "PASS" ET visual_read_confirmed == True).
+
+    zone_names : si fourni, limite l'audit à ces zones (typiquement celles construites
+    par le plan en cours, voir execute_level_plan()) ; sinon audite TOUTES les zones
+    connues du manifest.
+
+    Lit exactement le même fichier que `python3 Tools/qc_gate.py --check-manifest`
+    (côté Cowork bash) mais en pur stdlib -- lire le manifest ne demande ni PIL ni
+    numpy, seule l'ANALYSE de pixels (qc_gate.py --zone, analyze_screenshot.analyze())
+    en a besoin et doit donc rester côté Cowork bash. Cette fonction ne remplace pas
+    qc_gate.py, elle permet juste de brancher l'audit "quelles zones n'ont jamais été
+    complètement vérifiées" directement dans execute_level_plan(), sans dépendre d'un
+    appel manuel séparé après coup (voir CLAUDE.md "BOUCLE QC FERMÉE").
+
+    Retourne une liste de dicts {"zone": str, "reasons": [...]} -- liste vide = tout
+    est vérifié (qc_gate PASS + lecture visuelle confirmée) pour les zones demandées.
+    """
+    data = _load_qc_manifest()
+    keys = zone_names if zone_names is not None else list(data.keys())
+
+    pending = []
+    for zone in keys:
+        entry = data.get(zone)
+        if entry is None:
+            pending.append({"zone": zone, "reasons": [
+                "aucune entrée manifest (pas construite via verified_zone_build() ?)"]})
+            continue
+        reasons = []
+        verdict = entry.get("qc_gate_verdict")
+        if verdict is None:
+            reasons.append("qc_gate.py jamais lancé sur cette zone (--zone manquant côté Cowork)")
+        elif verdict != "PASS":
+            reasons.append(f"dernier verdict qc_gate: {verdict}")
+        if not entry.get("visual_read_confirmed"):
+            reasons.append("lecture visuelle jamais confirmée (--confirm-visual-read manquant)")
+        if reasons:
+            pending.append({"zone": zone, "reasons": reasons})
+    return pending
+
+
 def verified_zone_build(build_fn, zone_name, x_min, x_max, cx=None, cy=0,
                           style="silent_hill", max_passes=3, capture_pos=None):
     """Boucle fermee build -> fix -> re-verifie -> capture, avec relance automatique
@@ -1026,7 +1118,13 @@ def verified_zone_build(build_fn, zone_name, x_min, x_max, cx=None, cy=0,
 
     Retourne :
         {"zone_name": str, "errors": [...], "warnings": [...], "screenshot": path,
-         "passes": int, "structural_pass": bool}
+         "passes": int, "structural_pass": bool, "qc_manifest": path}
+
+    Chaque appel enregistre aussi une entrée "pending" dans le manifest QC persistant
+    (Saved/QC/qc_manifest.json, voir _record_qc_pending()) -- `python3 Tools/qc_gate.py
+    --check-manifest` permet d'auditer, depuis Cowork, quelles zones construites n'ont
+    JAMAIS eu leur screenshot passé par qc_gate.py ni leur lecture visuelle confirmée,
+    plutôt que de compter sur le fait qu'aucun agent n'a oublié cette étape.
     """
     import re, time
     from ue5_utils import capture_reference_screenshot, point_light
@@ -1099,16 +1197,20 @@ def verified_zone_build(build_fn, zone_name, x_min, x_max, cx=None, cy=0,
     )
 
     structural_pass = len(errors) == 0
+    manifest_path = _record_qc_pending(zone_name, screenshot_path, errors, warnings)
     print(f"\n[verified_zone_build] '{zone_name}' -- {passes_done} passe(s), "
           f"{len(errors)} erreur(s) restante(s), {len(warnings)} warning(s)")
     print(f"[verified_zone_build] Screenshot: {screenshot_path}")
+    print(f"[verified_zone_build] Manifest QC (pending) : {manifest_path}")
     print("[verified_zone_build] ETAPE OBLIGATOIRE SUIVANTE : Read(screenshot) + "
-          "Tools/qc_gate.py avant de declarer quoi que ce soit termine.")
+          "Tools/qc_gate.py --zone {} avant de declarer quoi que ce soit termine "
+          "(sinon 'python3 Tools/qc_gate.py --check-manifest' verra cette zone "
+          "'PENDING_VERIFICATION' indefiniment).".format(zone_name))
 
     return {
         "zone_name": zone_name, "errors": errors, "warnings": warnings,
         "screenshot": screenshot_path, "passes": passes_done,
-        "structural_pass": structural_pass,
+        "structural_pass": structural_pass, "qc_manifest": manifest_path,
     }
 
 
