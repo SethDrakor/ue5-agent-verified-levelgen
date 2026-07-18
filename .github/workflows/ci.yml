@@ -12,8 +12,8 @@ jobs:
     name: Repo integrity (structural, stdlib-only)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
       - name: No NUL bytes / valid Python / valid JSON / balanced C++ braces
@@ -23,8 +23,8 @@ jobs:
     name: Doc references (README + docs/*.md)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
       - name: Every referenced file/image actually exists
@@ -34,8 +34,8 @@ jobs:
     name: python_toolchain (import + unit tests + lint)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
       - name: Install test/lint dependencies
