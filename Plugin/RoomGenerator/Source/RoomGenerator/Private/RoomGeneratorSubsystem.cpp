@@ -7,6 +7,9 @@
 #include "Editor.h"
 #include "Modules/ModuleManager.h"
 #include "RoomGeneratorModule.h"
+#include "GameFramework/PlayerController.h"
+#include "GameFramework/PlayerInput.h"
+#include "InputCoreTypes.h"
 
 IMPLEMENT_MODULE(FRoomGeneratorModule, RoomGenerator)
 
@@ -176,4 +179,41 @@ void URoomGeneratorSubsystem::GenerateCorridor(
 		FVector(Length / S, WallThickness / S, Height / S),
 		CorridorName + TEXT("_WallR"));
 	if (WallR) WallR->SetActorRotation(Rot);
+}
+
+// ---------------------------------------------------------------------------
+// SimulateKeyPress
+// ---------------------------------------------------------------------------
+
+bool URoomGeneratorSubsystem::SimulateKeyPress(APlayerController* PC, FName KeyName)
+{
+	if (!PC)
+	{
+		UE_LOG(LogTemp, Error, TEXT("RoomGenerator::SimulateKeyPress - PC is null"));
+		return false;
+	}
+
+	const FKey Key(KeyName);
+	if (!Key.IsValid())
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("RoomGenerator::SimulateKeyPress - invalid key name '%s'"), *KeyName.ToString());
+		return false;
+	}
+
+	// Both Pressed and Released in the same call -- mirrors a real, quick key
+	// tap. Sending only Pressed would leave the key considered "held" until
+	// something else releases it, which could confuse any Tick-based logic
+	// reading is_input_key_down() afterward.
+	FInputKeyParams PressParams;
+	PressParams.Key = Key;
+	PressParams.Event = IE_Pressed;
+	PC->InputKey(PressParams);
+
+	FInputKeyParams ReleaseParams;
+	ReleaseParams.Key = Key;
+	ReleaseParams.Event = IE_Released;
+	PC->InputKey(ReleaseParams);
+
+	return true;
 }

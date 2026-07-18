@@ -40,11 +40,13 @@ verified, both visually and automatically, that the result is correct."
 └───────────────────────────┬───────────────────────────────────┘
                              │
 ┌───────────────────────────▼───────────────────────────────────┐
-│  Python toolchain (~4,500 lines)                               │
+│  Python toolchain (~6,500 lines)                               │
 │  • safe_place / safe_spawn_enemy — zero-overlap placement      │
 │  • verify_level — automatic level verification                │
 │  • test_suite — anti-regression test suite for the plugin      │
 │  • horror_presets — room/atmosphere templates                  │
+│  • playtest_agent — drives a live PIE session, journals real   │
+│    gameplay events (project-specific, see docs/ARCHITECTURE)   │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -89,14 +91,29 @@ approximation in plain numpy (no `scikit-image` dependency). A low similarity
 score doesn't auto-fail anything — it's a flag that something changed,
 surfaced for a human/vision read rather than silently missed.
 
+**Behavioral testing, not just structural.** Every check above judges a
+level frozen in place. `python_toolchain/playtest_agent.py` instead drives
+the player character through a live PIE session in real time and journals
+timestamped gameplay events (enemy detection, jumpscares, the player getting
+stuck or caught) by reading actual game state as it happens. It's the one
+module in this repo that's project-specific rather than generic — and also
+the one that has caught a real gameplay bug rather than a tooling one: a
+playtest run with zero enemy detections across an entire level traced back
+to `AIPerceptionComponent.auto_activate = false` on the enemy Blueprint's
+component template, invisible to every structural or visual check above,
+found only by an agent actually playing the level. See
+`docs/ARCHITECTURE.md` for the rest of what it does (real NavMesh
+pathfinding instead of a straight line, a simulated key press for
+interactions, an "invincible" mode to isolate navigation tests from combat).
+
 ## Numbers
 
 | | |
 |---|---|
-| C++ (plugin) | ~1,850 lines |
-| Python toolchain | ~5,800 lines (+ ~800 lines of standalone QA/CI tooling in `Tools/`) |
-| Automated tests | 81 in-editor (`test_suite.py`, run before/after any plugin change) + 9 editor-independent (`pytest`, this repo's CI) |
-| Undocumented UE5.7 API quirks identified and worked around | 19 (see `docs/KNOWN_ISSUES.md`) |
+| C++ (plugin) | ~1,900 lines |
+| Python toolchain | ~6,500 lines (+ ~800 lines of standalone QA/CI tooling in `Tools/`) |
+| Automated tests | 81 in-editor (`test_suite.py`, run before/after any plugin change) + 10 editor-independent (`pytest`, this repo's CI) |
+| Undocumented UE5.7 API quirks identified and worked around | 20 (see `docs/KNOWN_ISSUES.md`) |
 
 ## Stack
 
@@ -108,7 +125,10 @@ control · Behavior Trees & Blackboards (enemy AI) · Lumen/PostProcess (lightin
 
 Active solo project. The RoomGenerator plugin and the Python toolchain are
 generic — reusable on any UE5 project that needs agent-driven level
-generation or Blueprint editing.
+generation or Blueprint editing. `playtest_agent.py` is the one exception:
+it's an applied example built on top of that generic toolchain, wired to
+this project's own Blueprint paths and Blackboard keys rather than being
+portable as-is.
 
 ## Proof, not just claims
 

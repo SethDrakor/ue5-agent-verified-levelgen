@@ -16,7 +16,7 @@ import importlib
 
 import pytest
 
-MODULES = ["ue5_utils", "verify_level", "horror_presets", "test_suite"]
+MODULES = ["ue5_utils", "verify_level", "horror_presets", "test_suite", "playtest_agent"]
 
 
 @pytest.mark.parametrize("module_name", MODULES)

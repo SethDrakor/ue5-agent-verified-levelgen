@@ -199,3 +199,28 @@ the stale truncated view. Copying it via a script executed by the *target*
 process (Unreal's own Python, which reads the real Windows filesystem
 directly) and verifying with a hash comparison in that same call sidesteps
 the problem entirely.
+
+**Live Coding can crash the editor outright if a `UFUNCTION` is added to a
+class with a live, actively-referenced instance in a running Python
+session.** Adding a new Blueprint-callable function to an `UEditorSubsystem`
+that a Python-driven MCP session already held a handle to and was calling
+regularly, then triggering `LiveCoding.Compile`, compiled successfully —
+but immediately after the hot-reload, the same Python bridge that had been
+returning real stdout/exceptions started returning a generic
+"script executed without error" message for *every* script sent, including
+one that did nothing but `raise Exception(...)`. A few calls later the editor
+crashed with `EXCEPTION_ACCESS_VIOLATION` (write), stack
+`python311 → PythonScriptPlugin → CoreUObject → LiveCoding`. Best-guess root
+cause (not instrumented further — the editor was gone before it could be):
+Live Coding patches a class's function/reflection table in place; a Python
+call landing on that table mid-patch, or immediately after, can read a
+half-updated pointer. The genuinely useful part of this finding isn't the
+crash itself — it's that the bridge misbehaving (real output replaced by a
+canned success message) was a legible warning *before* the crash, not just
+in hindsight. **Rule adopted**: for any C++ change that adds or changes a
+`UFUNCTION` on a class with an instance actively in use by a running agent
+session, recompile via a full editor-closed build (`Build.bat`) instead of
+Live Coding. If Live Coding is used anyway, treat a bridge that stops
+echoing real stdout/exceptions immediately after a hot-reload as a hard stop
+— restart the editor rather than continuing to issue commands hoping it
+self-recovers.

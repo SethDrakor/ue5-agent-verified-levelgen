@@ -51,6 +51,49 @@ Python interpreter directly. Both ultimately execute Python inside
   per-zone baseline screenshot (see the README for the reliability
   rationale).
 
+**Behavioral playtesting (`playtest_agent.py`, applied on top of the toolchain
+above — project-specific, unlike the generic files listed above).** Every
+tool up to this point judges a *static* level state — geometry, materials,
+a screenshot. This module instead drives the actual player character through
+a live PIE session and journals timestamped events by reading real game
+state, closing the gap between "the level passed structural checks" and "the
+level actually plays correctly." Architecture notes that mattered in
+practice:
+- PIE runs in real time between MCP calls, not during them. The player is
+  piloted by a callback registered with
+  `unreal.register_slate_post_tick_callback()`, which keeps running on its
+  own between one agent call and the next — no polling loop needed on the
+  agent side.
+- Waypoint-to-waypoint movement is routed through
+  `NavigationSystemV1.find_path_to_location_synchronously()` rather than a
+  straight line, with a fallback to the straight line if no path is found
+  (`is_valid` can be `True` with an empty `path_points`, which the code
+  guards against explicitly) and an automatic replan whenever the player is
+  detected as stuck.
+- Enemy Blackboard state (`CanSeePlayer?`, `IsIlluminated`, ...) is
+  re-queried by scanning live actors every tick rather than caching a
+  reference across ticks — an intermittent Python binding bug
+  (`SystemLibrary.is_valid()` raising `TypeError` on a cached actor
+  reference between ticks) made caching unreliable enough to just avoid.
+- Real key presses (for pickups, switches, doors) are simulated through a
+  small C++ addition (`RoomGeneratorSubsystem::SimulateKeyPress`,
+  `PC->InputKey(FInputKeyParams)`), since the Python API only exposes
+  read-only input queries (`is_input_key_down`, `was_input_key_just_pressed`)
+  with nothing to inject a key state.
+- An "invincible" mode isolates a navigation/ambiance test from enemy
+  combat behavior by toggling `generate_overlap_events` on the specific
+  collision component that triggers a capture, on the live actor instance —
+  no Blueprint edit, fully reversible at the end of the run.
+
+This module is the one piece of the toolchain that is *not* generic — it
+references this project's specific Blueprint paths and Blackboard key names.
+It's included anyway because it's also the one piece that has caught a real
+gameplay bug rather than a geometry/tooling one: a playtest run showed zero
+enemy detections across the whole level, which traced back to
+`AIPerceptionComponent.auto_activate = false` on the enemy Blueprint's
+component template — invisible to every structural check in this repo, only
+found by an agent actually playing the level and noticing nothing reacted.
+
 ## The placement problem, in three layers
 
 Naively spawning an actor at a chosen (x, y) coordinate risks it landing
