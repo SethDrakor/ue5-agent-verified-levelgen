@@ -137,12 +137,13 @@ included, before a single `save()` is allowed to happen:
 
 ![run_verify() passing](media/run_verify_passing.png)
 
-The anti-regression suite for the plugin and Python toolchain (baseline
-capture below is from an earlier pass at 45/45 — the suite has grown since,
-see the Numbers table above for the current count; same suite, same
-before/after diff logic):
+The anti-regression suite for the plugin and Python toolchain. **The screenshot
+below is a historical capture at 45/45** — the suite has grown considerably
+since (see the Numbers table above for the current, accurate count); same
+suite, same before/after diff logic, kept here as an illustration of the
+pass/fail output format rather than an up-to-date count:
 
-![test_suite passing](media/test_suite_45_45.png)
+![test_suite passing (historical capture, suite has since grown — see Numbers table above)](media/test_suite_45_45.png)
 
 ---
 
