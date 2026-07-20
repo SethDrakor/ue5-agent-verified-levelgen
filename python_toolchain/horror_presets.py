@@ -13,10 +13,9 @@ Contient :
 
 import unreal
 import random
-from ue5_utils import (aeas, spawn, point_light, place_static_mesh,
+from ue5_utils import (aeas, point_light, place_static_mesh,
                        scatter_props, tag_actor, save,
-                       build_occupancy_grid_from_level, safe_spawn_enemy,
-                       actor_by_label, all_actors)
+                       build_occupancy_grid_from_level, safe_spawn_enemy)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -740,7 +739,6 @@ def apply_material_to_zone(x_min, x_max, style="silent_hill",
         apply_material_to_zone(0, 1400, style="silent_hill")
     """
     preset = _resolve_style(WALL_PRESETS, style, "WALL_PRESETS")
-    zone_tag = "z{}_".format(int((x_min + x_max) / 2 / 1400) + 1)
 
     # Creer les instances si pas de custom
     mi_wall  = custom_wall  or create_material_instance(

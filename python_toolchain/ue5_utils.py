@@ -1003,7 +1003,7 @@ def run_steps(steps, stop_on_error=True, auto_save=True, verbose=True):
             "Vérifier": "print(f'{len(all_actors())} acteurs total')",
         })
     """
-    import io, sys, traceback, datetime
+    import io, sys, traceback
 
     shared = {}
     exec("from ue5_utils import *\nimport unreal", shared)
@@ -1490,7 +1490,6 @@ def update_memory(section, content):
 
 def append_todo(item):
     """Ajoute un item TODO dans GAME_MEMORY.md."""
-    import re
     path = _memory_path()
     with open(path, encoding="utf-8") as f:
         text = f.read()
@@ -1523,7 +1522,7 @@ def memory_snapshot():
         lines = f.readlines()
     todos = [l.strip() for l in lines if l.strip().startswith("- [ ]")]
     done  = [l.strip() for l in lines if l.strip().startswith("- [x]")]
-    print(f"=== GAME MEMORY SNAPSHOT ===")
+    print("=== GAME MEMORY SNAPSHOT ===")
     print(f"TODO ({len(todos)}) :")
     for t in todos: print(f"  {t}")
     print(f"DONE ({len(done)}) :")

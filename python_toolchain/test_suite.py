@@ -165,7 +165,7 @@ def _test_bgh(bp):
 
 def _test_ue5_utils(bp):
     try:
-        from ue5_utils import aeas, bpes, bgh, BPGraph, load_bp, compile_bp
+        from ue5_utils import aeas, bpes, bgh, BPGraph, compile_bp
     except Exception as e:
         _results.append((_FAIL, "ue5_utils import", str(e)))
         return
