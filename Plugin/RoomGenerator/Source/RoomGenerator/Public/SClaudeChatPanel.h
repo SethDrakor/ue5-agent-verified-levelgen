@@ -7,6 +7,7 @@ class SMultiLineEditableTextBox;
 class SEditableTextBox;
 class SVerticalBox;
 class STextBlock;
+class SCheckBox;
 
 class SClaudeChatPanel : public SCompoundWidget
 {
@@ -25,6 +26,7 @@ private:
     TSharedPtr<SEditableTextBox>          ApiKeyBox;
     TSharedPtr<SVerticalBox>             MessagesBox;
     TSharedPtr<STextBlock>               ThinkingLabel;
+    TSharedPtr<SCheckBox>                ScreenshotCheckBox;
 
     bool bUpdatingProgrammatically = false;
 

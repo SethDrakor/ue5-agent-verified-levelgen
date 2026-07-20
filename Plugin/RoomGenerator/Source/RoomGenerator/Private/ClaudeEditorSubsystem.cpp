@@ -11,6 +11,7 @@
 #include "HAL/FileManager.h"
 #include "Modules/ModuleManager.h"
 #include "Editor.h"
+#include "Misc/Base64.h"
 
 // ---------------------------------------------------------------------------
 // Initialize
@@ -108,11 +109,56 @@ void UClaudeEditorSubsystem::SendMessage(const FString& UserMessage)
     bIsProcessing = true;
     OnThinking.Broadcast();
 
+    // Si demande, capturer un screenshot AVANT de notifier "thinking" au sens API — la
+    // capture elle-meme est synchrone (GEditor->Exec bloquant) donc pas besoin d'un etat
+    // intermediaire supplementaire.
+    FString ScreenshotBase64;
+    if (bAttachScreenshot)
+    {
+        ScreenshotBase64 = CaptureViewportScreenshotBase64();
+        if (ScreenshotBase64.IsEmpty())
+        {
+            OnMessage.Broadcast(
+                TEXT("Capture de screenshot echouee — message envoye en texte seul "
+                     "(voir Output Log pour le detail)."), true);
+        }
+    }
+
     // Ajouter le message utilisateur a l'historique.
-    // Format Anthropic : "content" peut etre une simple string pour un message texte.
+    // Format Anthropic : "content" peut etre une simple string (texte seul) OU un tableau
+    // de blocs {"type":"text",...}/{"type":"image",...} quand une image est attachee.
     TSharedPtr<FJsonObject> UserMsg = MakeShareable(new FJsonObject);
-    UserMsg->SetStringField(TEXT("role"),    TEXT("user"));
-    UserMsg->SetStringField(TEXT("content"), UserMessage);
+    UserMsg->SetStringField(TEXT("role"), TEXT("user"));
+
+    if (ScreenshotBase64.IsEmpty())
+    {
+        UserMsg->SetStringField(TEXT("content"), UserMessage);
+    }
+    else
+    {
+        TSharedPtr<FJsonObject> ImgSource = MakeShareable(new FJsonObject);
+        ImgSource->SetStringField(TEXT("type"),       TEXT("base64"));
+        ImgSource->SetStringField(TEXT("media_type"), TEXT("image/png"));
+        ImgSource->SetStringField(TEXT("data"),       ScreenshotBase64);
+
+        TSharedPtr<FJsonObject> ImgBlock = MakeShareable(new FJsonObject);
+        ImgBlock->SetStringField(TEXT("type"), TEXT("image"));
+        ImgBlock->SetObjectField(TEXT("source"), ImgSource);
+
+        TSharedPtr<FJsonObject> TextBlock = MakeShareable(new FJsonObject);
+        TextBlock->SetStringField(TEXT("type"), TEXT("text"));
+        TextBlock->SetStringField(TEXT("text"), UserMessage);
+
+        // Image avant le texte (recommandation Anthropic : ameliore la qualite quand le
+        // texte fait reference a l'image, ex. "est-ce que cette salle est trop sombre ?").
+        TArray<TSharedPtr<FJsonValue>> ContentBlocks;
+        ContentBlocks.Add(MakeShareable(new FJsonValueObject(ImgBlock)));
+        ContentBlocks.Add(MakeShareable(new FJsonValueObject(TextBlock)));
+        UserMsg->SetArrayField(TEXT("content"), ContentBlocks);
+
+        OnMessage.Broadcast(TEXT("[Screenshot attache a ce message]"), false);
+    }
+
     History.Add(UserMsg);
 
     CallApi();
@@ -189,6 +235,12 @@ void UClaudeEditorSubsystem::CallApi()
     Request->SetHeader(TEXT("anthropic-version"), TEXT("2023-06-01"));
     Request->SetHeader(TEXT("content-type"), TEXT("application/json"));
     Request->SetContentAsString(JsonBody);
+    // Sans timeout explicite, une requete qui ne recoit jamais de reponse (reseau mort,
+    // API qui pend) ne declenche jamais OnHttpResponse -> bIsProcessing reste bloque a
+    // "true" pour toujours et le panneau se fige sans aucun message d'erreur. 45s laisse
+    // de la marge pour une reponse avec tool_use (plus lente qu'un simple texte) tout en
+    // bornant l'attente a une duree raisonnable pour un usage interactif.
+    Request->SetTimeout(45.0f);
     Request->OnProcessRequestComplete().BindUObject(
         this, &UClaudeEditorSubsystem::OnHttpResponse);
     Request->ProcessRequest();
@@ -357,6 +409,70 @@ void UClaudeEditorSubsystem::HandleResponse(TSharedPtr<FJsonObject> ResponseObj)
 }
 
 // ---------------------------------------------------------------------------
+// Vision — capture ecran (delegue au pipeline Python deja valide)
+// ---------------------------------------------------------------------------
+
+FString UClaudeEditorSubsystem::CaptureViewportScreenshotBase64()
+{
+    // Reutilise get_live_viewport_transform()/capture_reference_screenshot() de ue5_utils.py
+    // plutot que de reimplementer le SceneCaptureComponent2D + export RTF_RGBA8 en C++ — ce
+    // pipeline existe deja et est explicitement valide contre le piege EXR/PNG documente dans
+    // CLAUDE.md ("Screenshot fiable"). Le project Content/Python/ est deja sur sys.path via
+    // le PythonScriptPlugin, pas besoin de le rajouter ici.
+    //
+    // Marqueur unique plutot que "le chemin est la derniere ligne imprimee" : verifie en
+    // conditions reelles (via mcp__ue5-mcp__ue5_execute) que le premier import de ue5_utils
+    // dans une session declenche un vrai print("[ue5_utils] loaded ...") au niveau module —
+    // se fier a la derniere ligne aurait marche par chance la plupart du temps et echoue de
+    // facon sournoise (mauvaise image envoyee) exactement au premier appel de la session.
+    static const FString Marker = TEXT("CLAUDE_PANEL_SCREENSHOT_PATH::");
+
+    const FString CaptureScript = FString::Printf(
+        TEXT("from ue5_utils import capture_reference_screenshot, get_live_viewport_transform\n")
+        TEXT("x, y, z, pitch, yaw, roll = get_live_viewport_transform()\n")
+        TEXT("_p = capture_reference_screenshot(x, y, z, pitch=pitch, yaw=yaw, roll=roll, name='claude_panel_vision')\n")
+        TEXT("print('%s' + _p)\n"),
+        *Marker);
+
+    const FString RawOutput = ExecutePython(CaptureScript);
+
+    int32 MarkerIdx = RawOutput.Find(Marker, ESearchCase::CaseSensitive, ESearchDir::FromEnd);
+    if (MarkerIdx == INDEX_NONE)
+    {
+        UE_LOG(LogTemp, Warning,
+            TEXT("ClaudePanel: marqueur de capture introuvable dans la sortie : %s"), *RawOutput);
+        return FString();
+    }
+
+    FString PngPath = RawOutput.Mid(MarkerIdx + Marker.Len());
+    int32 NewlineIdx;
+    if (PngPath.FindChar(TEXT('\n'), NewlineIdx))
+    {
+        PngPath = PngPath.Left(NewlineIdx);
+    }
+    PngPath.TrimStartAndEndInline();
+
+    // Verifier que ca ressemble bien a un PNG existant avant de charger, plutot que de
+    // tenter LoadFileToArray sur une valeur inattendue et echouer plus loin avec un
+    // message moins clair.
+    if (!PngPath.EndsWith(TEXT(".png")) || !FPaths::FileExists(PngPath))
+    {
+        UE_LOG(LogTemp, Warning,
+            TEXT("ClaudePanel: capture screenshot echouee, chemin extrait : %s"), *PngPath);
+        return FString();
+    }
+
+    TArray<uint8> PngBytes;
+    if (!FFileHelper::LoadFileToArray(PngBytes, *PngPath))
+    {
+        UE_LOG(LogTemp, Warning, TEXT("ClaudePanel: impossible de lire %s"), *PngPath);
+        return FString();
+    }
+
+    return FBase64::Encode(PngBytes);
+}
+
+// ---------------------------------------------------------------------------
 // Python execution — via fichier temporaire + commande console "py"
 // Ne necessite pas WITH_PYTHON ni IPythonScriptPlugin au compile time.
 // ---------------------------------------------------------------------------
@@ -368,10 +484,16 @@ FString UClaudeEditorSubsystem::ExecutePython(const FString& Code)
         return TEXT("ERREUR : GEditor non disponible.");
     }
 
+    // Suffixe unique par appel — evite qu'un second execute_python (meme reponse, tool_use
+    // multiple ; ou appel suivant pendant qu'un ancien fichier traine) n'ecrase les fichiers
+    // temporaires d'un appel precedent avant qu'ils aient ete relus, et garde une trace de
+    // chaque script execute dans Saved/Claude/ pour le debug.
+    const FString Suffix = FString::Printf(TEXT("_%06d"), ++PythonExecCounter);
+
     FString TempDir    = FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("Claude"));
-    FString ExecFile   = FPaths::Combine(TempDir, TEXT("_exec.py"));
-    FString WrapFile   = FPaths::Combine(TempDir, TEXT("_wrap.py"));
-    FString OutputFile = FPaths::Combine(TempDir, TEXT("_output.txt"));
+    FString ExecFile   = FPaths::Combine(TempDir, TEXT("_exec")   + Suffix + TEXT(".py"));
+    FString WrapFile   = FPaths::Combine(TempDir, TEXT("_wrap")   + Suffix + TEXT(".py"));
+    FString OutputFile = FPaths::Combine(TempDir, TEXT("_output") + Suffix + TEXT(".txt"));
     IFileManager::Get().MakeDirectory(*TempDir, true);
 
     // 1. Ecrire le code utilisateur

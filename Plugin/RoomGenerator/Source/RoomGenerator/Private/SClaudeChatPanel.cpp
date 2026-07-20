@@ -9,6 +9,7 @@
 #include "Widgets/Input/SMultiLineEditableTextBox.h"
 #include "Widgets/Input/SEditableTextBox.h"
 #include "Widgets/Input/SButton.h"
+#include "Widgets/Input/SCheckBox.h"
 #include "Widgets/Text/STextBlock.h"
 #include "Widgets/SBoxPanel.h"
 #include "Styling/AppStyle.h"
@@ -117,6 +118,33 @@ void SClaudeChatPanel::Construct(const FArguments& InArgs)
                 .IsPassword(true)
                 .Font(FCoreStyle::GetDefaultFontStyle("Regular", 8))
                 .OnTextChanged(this, &SClaudeChatPanel::OnApiKeyChanged)
+            ]
+        ]
+
+        // ── Vision (joindre un screenshot au prochain message) ──────────────
+        + SVerticalBox::Slot()
+        .AutoHeight()
+        .Padding(6.f, 0.f, 6.f, 3.f)
+        [
+            SNew(SHorizontalBox)
+            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
+            [
+                SAssignNew(ScreenshotCheckBox, SCheckBox)
+                .IsChecked(ECheckBoxState::Unchecked)
+                .OnCheckStateChanged_Lambda([this](ECheckBoxState NewState)
+                {
+                    if (UClaudeEditorSubsystem* Sub = GetSub())
+                    {
+                        Sub->bAttachScreenshot = (NewState == ECheckBoxState::Checked);
+                    }
+                })
+            ]
+            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(4.f, 0.f, 0.f, 0.f)
+            [
+                SNew(STextBlock)
+                .Text(LOCTEXT("VisionLabel", "Vision : joindre un screenshot (position actuelle du viewport) au prochain message"))
+                .Font(FCoreStyle::GetDefaultFontStyle("Regular", 8))
+                .ColorAndOpacity(FSlateColor(FLinearColor(0.65f, 0.65f, 0.65f)))
             ]
         ]
 

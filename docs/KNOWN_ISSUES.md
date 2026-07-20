@@ -224,3 +224,55 @@ Live Coding. If Live Coding is used anyway, treat a bridge that stops
 echoing real stdout/exceptions immediately after a hot-reload as a hard stop
 — restart the editor rather than continuing to issue commands hoping it
 self-recovers.
+
+**A style not present in every palette dict falls back silently, per
+sub-system, with no error.** Room/corridor generation pulls per-style values
+from several separate dicts (wall materials, post-process settings, light
+palettes, prop sets, ambient audio, fog). Each one used its own
+`dict.get(style, dict["silent_hill"])` call. Adding a new style to most of
+these dicts but missing just one meant every room built with that style got
+one *specific* sub-system silently downgraded to a different style's
+values — nothing raised, nothing logged, and the room still looked
+"finished." Fixed by a single `_resolve_style()` helper used at every call
+site, which logs an error naming the missing dict before falling back, plus a
+regression test asserting all palette dicts share the exact same key set —
+so a future new style either lands in all of them or fails loudly in the test
+suite, instead of silently in whichever dict got forgotten.
+
+**An HTTP request issued with no timeout can wedge a "processing" flag
+forever.** The in-editor Anthropic-backed chat panel set a busy flag before
+sending its HTTP request and cleared it in the response callback — if the
+network call never completes (dead network, hung endpoint), that callback
+never fires, and the flag stays set permanently: the panel silently stops
+accepting new messages, with no error surfaced anywhere. Fixed with an
+explicit request timeout, so the failure path (callback fires with an error)
+is always reachable.
+
+**Fixed-name temporary files for out-of-process Python execution can be
+clobbered by overlapping calls.** A tool that shells out to a script by
+writing it to a fixed path, running it, then reading a fixed output path back
+works fine for one call at a time — but a single agent response containing
+more than one such call (or two calls whose lifetimes overlap even briefly)
+can have the second call's write land on top of the first call's still-unread
+files. Fixed by suffixing every temp filename with a per-call counter, so
+concurrent or rapid sequential calls never share a path.
+
+**"The last line printed is the file path" breaks the moment the module
+being called prints anything else on import.** A screenshot-capture helper
+that shells out to a Python module and parses the freshest stdout line as a
+file path worked in isolated testing, then returned garbage as soon as it ran
+inside a session where that module's own load-time logging line (printed
+once, on first import) came after the real result — an ordering that isn't
+guaranteed to stay stable as the module changes. Fixed by having the callee
+print a unique sentinel string immediately before the real value, and having
+the caller search for that sentinel instead of assuming positional order.
+
+**Two legacy scripts turned out to be permanently broken, not just
+outdated.** Two pre-dating-the-current-toolchain scripts (manual Blueprint
+node pasting, before a JSON-driven graph builder replaced that approach
+entirely) were found to contain a backslash inside an f-string expression —
+syntactically invalid on any Python version below 3.12, which is what the
+embedded engine interpreter runs. Nothing imported them anymore (confirmed by
+searching the rest of the toolchain for references), so rather than fix
+syntax in dead code, they were deleted, and the exemption list an integrity
+checker had carried for exactly these two files was emptied out to match.

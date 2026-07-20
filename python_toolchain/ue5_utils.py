@@ -1003,7 +1003,7 @@ def run_steps(steps, stop_on_error=True, auto_save=True, verbose=True):
             "Vérifier": "print(f'{len(all_actors())} acteurs total')",
         })
     """
-    import io, sys, traceback
+    import io, sys, traceback, datetime
 
     shared = {}
     exec("from ue5_utils import *\nimport unreal", shared)
@@ -1093,22 +1093,19 @@ def retry_step(step_name, corrected_code, previous_results, shared_ctx=None):
 # safe_append() plutôt que de dépendre d'un commit git ou d'une relecture
 # manuelle.
 
-# Fichiers legacy avec une incompatibilite Python <3.12 preexistante
-# (backslash dans la partie expression d'un f-string — invalide avant 3.12,
-# et l'interpreteur embarque dans UE5.7 est < 3.12), decouverte PAR ce
-# garde-fou lui-meme le jour de sa creation, sans aucun rapport avec de la
-# corruption : blueprint_modifier.py / paste_helpers.py sont des scripts
-# manuels de generation de T3D a coller dans l'editeur de graphe (workflow
-# pre-BatchWireGraph/BPGraph, confirme non importes par le reste du pipeline
-# actuel via grep). Une partie des occurrences a ete corrigee (variables
-# pre-quotees), le reste est une toile de guillemets imbriques trop dense
-# pour une correction mecanique sans risque — voir GAME_MEMORY.md pour la
-# decision (reecrire completement ou supprimer, non tranchee a ce jour).
-# Exemptes UNIQUEMENT du check ast.parse ci-dessous ; le check NUL bytes
-# (le vrai signal de corruption) reste actif dessus comme sur tout le reste.
-# Ne jamais ajouter un fichier ici pour faire taire un vrai probleme sans
-# une raison documentee equivalente.
-_INTEGRITY_PARSE_EXEMPT = {"blueprint_modifier.py", "paste_helpers.py"}
+# Ancienne exemption _INTEGRITY_PARSE_EXEMPT = {"blueprint_modifier.py", "paste_helpers.py"}
+# retiree le 2026-07-20 : ces deux scripts legacy de generation de T3D manuel
+# (workflow pre-BatchWireGraph/BPGraph, confirmes non importes par le reste
+# du pipeline via grep) etaient syntaxiquement invalides sur l'interpreteur
+# Python <3.12 embarque dans UE5.7 (backslash dans la partie expression d'un
+# f-string) et n'ont jamais ete corriges — decision de Thomas : supprimes
+# purement et simplement (Content/Python/ ET leurs doublons legacy dans
+# Content/HorrorGame/Python/Utils/, memes fichiers deja retires pour
+# horror_presets.py/ue5_utils.py, voir GAME_MEMORY.md) plutot que reecrits.
+# Plus aucun fichier n'est exempte du check ast.parse ci-dessous — ne jamais
+# en ajouter un pour faire taire un vrai probleme sans une raison documentee
+# equivalente a celle-ci.
+_INTEGRITY_PARSE_EXEMPT = frozenset()
 
 
 def verify_file_integrity(path, expected_text=None, check_parse=True):
@@ -1185,10 +1182,11 @@ def scan_content_python_integrity(verbose=True):
     session, ou après tout doute (édition suspecte, sync, crash, relecture
     du shell sandbox qui semble différer de ce que montre l'outil de lecture).
 
-    Les fichiers listés dans _INTEGRITY_PARSE_EXEMPT restent vérifiés pour les
-    octets NUL (le vrai signal de corruption) mais pas pour le parsing Python
-    — un souci de syntaxe déjà connu et documenté chez eux est loggé à part
-    en warning, sans faire échouer l'audit ni les tests de régression.
+    _INTEGRITY_PARSE_EXEMPT est vide depuis le 2026-07-20 (les deux seuls
+    fichiers qui y figuraient, syntaxiquement invalides et jamais corrigés,
+    ont été supprimés plutôt que réécrits — voir GAME_MEMORY.md) ; le
+    mécanisme reste en place pour une future exemption documentée, mais
+    aujourd'hui tous les .py de Content/Python/ passent le check ast.parse.
 
     Retourne la liste des (path, message) en échec bloquant — liste vide =
     tout sain (les warnings des fichiers exemptés n'y figurent pas).
@@ -1268,7 +1266,87 @@ def safe_write(path, content, must_contain=None):
                 pass
 
     unreal.log("[safe_write] OK {} ({} chars, ecriture atomique + integrite verifiee octet par octet)".format(os.path.basename(path), len(content)))
+
+    # Ferme la boucle documentee comme TODO non tranche dans CLAUDE.md (section trust_gate) :
+    # jusqu'ici trust_gate_record() etait un appel manuel, donc rien ne garantissait qu'une
+    # lecture ue5_native fraiche existe apres une ecriture reelle. Best-effort volontaire :
+    # une panne de trust_gate (Tools/trust_gate.py absent, etc.) ne doit jamais faire echouer
+    # une ecriture qui a deja passe verify_file_integrity() ci-dessus.
+    try:
+        trust_gate_record(path, backend="ue5_native", note="auto: safe_write")
+    except Exception as e:
+        unreal.log_error("[safe_write] trust_gate_record automatique a echoue (ecriture reussie malgre tout) : {}".format(e))
+
     return len(content)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TRUST GATE — quorum multi-canaux (ajoute 2026-07-14, voir CLAUDE.md + Tools/trust_gate.py)
+#
+# verify_file_integrity()/scan_content_python_integrity() ci-dessus verifient UN SEUL
+# canal a la fois et disent, dans leur propre docstring, "en cas de doute, confirmer
+# depuis UE5" — une convention ecrite, jamais un mecanisme. trust_gate_record() est le
+# cote UE5 (acces disque Windows natif) du quorum : appele en complement de l'equivalent
+# cote bash sandbox (python3 Tools/trust_gate.py --record bash_sandbox <path>), il permet
+# a trust_gate.compare_readings()/check_ledger() de trancher TRUSTED/DIVERGENT sans qu'un
+# agent ait a choisir a la main quel canal croire.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _load_trust_gate():
+    """Importe Tools/trust_gate.py par chemin de fichier direct (pas par nom de
+    module) — meme pattern que celui documente pour valider un script "a jour"
+    depuis UE5 plutot que de faire confiance a un import qui pourrait passer par
+    un etat mis en cache. Le fichier est lu ICI, par ce process, avec un acces
+    disque Windows natif : c'est exactement ce que ce module a besoin de garantir
+    pour etre un canal de confiance a part entiere dans le quorum."""
+    import importlib.util
+    # __file__ = <ROOT>/Content/Python/ue5_utils.py -> 3 dirname() pour remonter a ROOT
+    # (pas 2 : erreur commise dans la premiere version de cette fonction, attrapee en
+    # testant trust_gate_record() lui-meme le 2026-07-14 -- FileNotFoundError sur
+    # ROOT/Content/Tools/trust_gate.py au lieu de ROOT/Tools/trust_gate.py)
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    tg_path = os.path.join(root, "Tools", "trust_gate.py")
+    spec = importlib.util.spec_from_file_location("trust_gate_native", tg_path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def trust_gate_record(path, backend="ue5_native", note=None):
+    """Enregistre une lecture de `path` (relatif au projet ou absolu) dans le
+    quorum trust_gate, depuis l'interieur d'UE5 — le canal a acces disque Windows
+    natif, jusqu'ici le canal qui "faisait foi" par convention plutot que par
+    mecanisme verifiable. A appeler apres toute modification d'un fichier
+    critique de Content/Python/, en complement de l'enregistrement cote bash
+    sandbox, avant de trancher si le fichier est sain."""
+    tg = _load_trust_gate()
+    result = tg.record_reading(path, backend, note=note)
+    if result.get("ok"):
+        unreal.log("[trust_gate] {} :: {} enregistre (sha256={}...)".format(backend, path, result["sha256"][:12]))
+    else:
+        unreal.log_error("[trust_gate] ECHEC enregistrement {} :: {} -> {}".format(backend, path, result.get("error")))
+    return result
+
+
+def trust_gate_compare(path):
+    """Verdict de quorum (TRUSTED/DIVERGENT/UNVERIFIED) pour un fichier, a partir
+    de tous les canaux ayant deja enregistre une lecture — utilisable directement
+    depuis UE5 sans repasser par le bash sandbox pour obtenir le verdict."""
+    tg = _load_trust_gate()
+    result = tg.compare_readings(path)
+    if result["verdict"] == "DIVERGENT":
+        unreal.log_error("[trust_gate] DIVERGENCE sur {} : {}".format(path, result["reason"]))
+    else:
+        unreal.log("[trust_gate] {} sur {} : {}".format(result["verdict"], path, result["reason"]))
+    return result
+
+
+def trust_gate_check(paths=None, strict_unverified=False):
+    """Audit global du quorum trust_gate pour tous les fichiers connus (ou une
+    liste donnee) — equivalent, cote UE5, de `python3 Tools/trust_gate.py
+    --check-ledger`."""
+    tg = _load_trust_gate()
+    return tg.check_ledger(paths=paths, strict_unverified=strict_unverified)
 
 
 # ══════════════════════════════════════════════════════
@@ -1412,6 +1490,7 @@ def update_memory(section, content):
 
 def append_todo(item):
     """Ajoute un item TODO dans GAME_MEMORY.md."""
+    import re
     path = _memory_path()
     with open(path, encoding="utf-8") as f:
         text = f.read()
@@ -1444,7 +1523,7 @@ def memory_snapshot():
         lines = f.readlines()
     todos = [l.strip() for l in lines if l.strip().startswith("- [ ]")]
     done  = [l.strip() for l in lines if l.strip().startswith("- [x]")]
-    print("=== GAME MEMORY SNAPSHOT ===")
+    print(f"=== GAME MEMORY SNAPSHOT ===")
     print(f"TODO ({len(todos)}) :")
     for t in todos: print(f"  {t}")
     print(f"DONE ({len(done)}) :")
@@ -1499,6 +1578,14 @@ def safe_append(path, content, must_contain=None):
                 pass
 
     unreal.log("[safe_append] OK {} ({} chars total, ecriture atomique + integrite verifiee)".format(os.path.basename(path), len(new_content)))
+
+    # Meme fermeture de boucle que safe_write() — voir son commentaire pour le TODO
+    # CLAUDE.md ferme ici. Best-effort, ne bloque jamais l'ecriture.
+    try:
+        trust_gate_record(path, backend="ue5_native", note="auto: safe_append")
+    except Exception as e:
+        unreal.log_error("[safe_append] trust_gate_record automatique a echoue (ecriture reussie malgre tout) : {}".format(e))
+
     return len(new_content)
 
 

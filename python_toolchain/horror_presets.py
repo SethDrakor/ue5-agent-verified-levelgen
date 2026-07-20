@@ -13,9 +13,10 @@ Contient :
 
 import unreal
 import random
-from ue5_utils import (aeas, point_light, place_static_mesh,
+from ue5_utils import (aeas, spawn, point_light, place_static_mesh,
                        scatter_props, tag_actor, save,
-                       build_occupancy_grid_from_level, safe_spawn_enemy)
+                       build_occupancy_grid_from_level, safe_spawn_enemy,
+                       actor_by_label, all_actors)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -284,31 +285,40 @@ def dress_danger_room(cx, cy, z=0, size=1200, seed=None, zone_prefix=None):
     return actors
 
 
-def dress_corridor_horror(x1, x2, cy=0, z=0, width=500, seed=None):
+def dress_corridor_horror(x1, x2, cy=0, z=0, width=500, seed=None, axis="x"):
     """Couloir horror : debris le long des murs, lampes clignotantes, quasi-noir.
 
-    x1, x2 : debut et fin du couloir sur l'axe X
-    cy      : centre Y du couloir
+    x1, x2 : debut et fin du couloir le long de l'axe de deplacement (voir `axis`)
+    cy      : centre sur l'axe perpendiculaire (Y si axis="x", X si axis="y")
     width   : largeur du couloir (pour placer les props pres des murs)
+    axis    : 'x' (defaut, couloir horizontal, comportement inchange depuis toujours)
+              ou 'y' (couloir vertical — ajoute le 2026-07-20 pour les embranchements
+              perpendiculaires de execute_level_plan(), voir son parametre 'anchor').
+              x1/x2 restent alors des coordonnees le long de Y, cy devient la
+              coordonnee X fixe — memes noms de parametres pour rester appelable a
+              l'identique, seule l'interpretation change.
     """
+    if axis not in ("x", "y"):
+        raise ValueError("dress_corridor_horror: axis doit etre 'x' ou 'y', recu {!r}".format(axis))
     if seed is None:
         seed = int(x1 + x2)
     random.seed(seed)
 
     length  = abs(x2 - x1)
-    cx      = (x1 + x2) / 2
+    along_center = (x1 + x2) / 2
     actors  = []
     step    = 300
     n_steps = max(1, int(length / step))
 
     for i in range(n_steps):
-        t   = i / max(1, n_steps - 1)
-        x   = x1 + t * (x2 - x1)
-        # Props contre le mur gauche ou droit
+        t     = i / max(1, n_steps - 1)
+        along = x1 + t * (x2 - x1)
+        # Props contre le mur gauche ou droit (relatif au sens de deplacement)
         side = random.choice([-1, 1])
-        oy   = side * (width * 0.35 + random.uniform(0, 30))
+        cross_offset = side * (width * 0.35 + random.uniform(0, 30))
+        wx, wy = (along, cy + cross_offset) if axis == "x" else (cy + cross_offset, along)
         path = random.choice(PROPS_CLUTTER)
-        a    = place_static_mesh(path, x, cy + oy, z,
+        a    = place_static_mesh(path, wx, wy, z,
                                   yaw=random.uniform(0, 360),
                                   label="CorrProp_{}".format(i))
         if a:
@@ -316,18 +326,20 @@ def dress_corridor_horror(x1, x2, cy=0, z=0, width=500, seed=None):
 
     # Lampes clignotantes
     n_lamps = max(1, int(length / 600))
-    atmosphere_flickering_lamps(cx, cy, z_lamp=z + 270,
+    lamp_cx, lamp_cy = (along_center, cy) if axis == "x" else (cy, along_center)
+    atmosphere_flickering_lamps(lamp_cx, lamp_cy, z_lamp=z + 270,
                                 count=n_lamps, spacing=int(length / n_lamps))
 
     # Quelques points de lumiere rouge tres faibles
     for i in range(2):
-        px = x1 + (x2 - x1) * (0.25 + i * 0.5)
-        point_light(px, cy, z + 150, intensity=300,
+        along_pt = x1 + (x2 - x1) * (0.25 + i * 0.5)
+        px, py = (along_pt, cy) if axis == "x" else (cy, along_pt)
+        point_light(px, py, z + 150, intensity=300,
                     rgb=(180, 20, 10), radius=250,
                     label="CorrRedGlow_{}".format(i))
 
-    unreal.log("[horror_presets] dress_corridor_horror ({}->{}) — {} props".format(
-        x1, x2, len(actors)))
+    unreal.log("[horror_presets] dress_corridor_horror axis={} ({}->{}) — {} props".format(
+        axis, x1, x2, len(actors)))
     return actors
 
 
@@ -477,6 +489,28 @@ def dress_level_zone(zone_name, cx, cy, z=0, size=1200, seed=None):
 MAT_BASE_PATH = "/Game/Materials"
 MAT_BASE_NAME = "M_HorrorBase"
 
+
+def _resolve_style(style_dict, style, dict_name="preset"):
+    """Resout `style` dans `style_dict`, avec repli sur 'silent_hill' si absent —
+    en LOGGANT une erreur explicite au lieu de le faire silencieusement.
+
+    Bug reel corrige le 2026-07-20 : ~8 endroits de ce fichier faisaient chacun leur
+    propre `X.get(style, X["silent_hill"])` sans aucun signal si `style` etait une
+    faute de frappe, OU un style ajoute dans certains des dicts par style mais pas
+    dans celui-ci precisement. Ce dernier cas n'etait pas hypothetique : le fog de
+    `setup_horror_room()`/`setup_zone_atmosphere()` n'avait JAMAIS eu d'entree
+    'alan_wake' depuis la creation de ce style — chaque salle 'alan_wake' recevait
+    silencieusement le fog de 'silent_hill' (densite/couleur differentes) sans que
+    rien ne le signale. Voir FOG_PRESETS plus bas pour le fix de ce cas precis.
+    """
+    if style in style_dict:
+        return style_dict[style]
+    unreal.log_error(
+        "[horror_presets] style '{}' inconnu dans {} — repli sur 'silent_hill' "
+        "(styles disponibles ici : {})".format(style, dict_name, sorted(style_dict.keys())))
+    return style_dict["silent_hill"]
+
+
 # Presets de couleurs par style (r,g,b lineaire 0-1)
 WALL_PRESETS = {
     "silent_hill":  {"wall":  (0.018, 0.015, 0.012),   # beton use tres sombre
@@ -491,6 +525,20 @@ WALL_PRESETS = {
     "alan_wake":    {"wall":  (0.013, 0.011, 0.009),   # bois de cabane trempe par la pluie
                      "floor": (0.007, 0.008, 0.009),   # sol humide, legerement bleu-froid
                      "ceil":  (0.004, 0.004, 0.005)},  # quasi-noir, foret nocturne
+}
+
+# Presets de fog (ExponentialHeightFog) par style. Extrait le 2026-07-20 de deux dicts
+# inline dupliques dans setup_zone_atmosphere() et setup_horror_room() qui n'avaient
+# JAMAIS eu d'entree 'alan_wake' — chaque salle de ce style recevait silencieusement le
+# fog de 'silent_hill' depuis la creation du style (voir _resolve_style() plus haut).
+# inscatter_color choisi coherent avec la palette lumiere alan_wake (Forest_Mist,
+# (140,200,175) — brume vert-bleu de foret nocturne humide), entre la densite institution
+# d'outlast (tres faible) et le brouillard iconique de silent_hill (dense).
+FOG_PRESETS = {
+    "silent_hill": dict(density=0.018, inscatter_color=(0.04, 0.04, 0.06), start_distance=80),
+    "outlast":     dict(density=0.008, inscatter_color=(0.02, 0.02, 0.03), start_distance=30),
+    "amnesia":     dict(density=0.012, inscatter_color=(0.05, 0.04, 0.02), start_distance=60),
+    "alan_wake":   dict(density=0.014, inscatter_color=(0.035, 0.045, 0.035), start_distance=70),
 }
 
 # Presets post-process par style
@@ -691,7 +739,8 @@ def apply_material_to_zone(x_min, x_max, style="silent_hill",
     Exemple :
         apply_material_to_zone(0, 1400, style="silent_hill")
     """
-    preset = WALL_PRESETS.get(style, WALL_PRESETS["silent_hill"])
+    preset = _resolve_style(WALL_PRESETS, style, "WALL_PRESETS")
+    zone_tag = "z{}_".format(int((x_min + x_max) / 2 / 1400) + 1)
 
     # Creer les instances si pas de custom
     mi_wall  = custom_wall  or create_material_instance(
@@ -767,7 +816,7 @@ def setup_horror_postprocess(preset="silent_hill", label="HorrorPostProcess"):
     ppv.set_editor_property('unbound', True)
     ppv.set_editor_property('priority', 1.0)
 
-    cfg = PP_PRESETS.get(preset, PP_PRESETS["silent_hill"])
+    cfg = _resolve_style(PP_PRESETS, preset, "PP_PRESETS (setup_horror_postprocess)")
     s = ppv.settings
 
     # Désactiver Lumen (obligatoire pour horror — ombres dures, noirs absolus)
@@ -879,11 +928,7 @@ def setup_zone_atmosphere(x_min, x_max, style="silent_hill"):
     """
     print("[atmosphere] Application style '{}' sur X={}-{}...".format(style, x_min, x_max))
 
-    fog_cfg = {
-        "silent_hill": dict(density=0.018, inscatter_color=(0.04, 0.04, 0.06), start_distance=80),
-        "outlast":     dict(density=0.008, inscatter_color=(0.02, 0.02, 0.03), start_distance=30),
-        "amnesia":     dict(density=0.012, inscatter_color=(0.05, 0.04, 0.02), start_distance=60),
-    }.get(style, dict(density=0.018, inscatter_color=(0.04, 0.04, 0.06), start_distance=80))
+    fog_cfg = _resolve_style(FOG_PRESETS, style, "FOG_PRESETS (setup_zone_atmosphere)")
 
     n_mats = apply_material_to_zone(x_min, x_max, style=style)
     ppv    = setup_horror_postprocess(preset=style)
@@ -1281,7 +1326,7 @@ def setup_global_atmosphere(style="silent_hill", label="PP_Horror"):
     s.override_camera_iso = True
     s.camera_iso = 1600.0
 
-    cfg = PP_PRESETS.get(style, PP_PRESETS["silent_hill"])
+    cfg = _resolve_style(PP_PRESETS, style, "PP_PRESETS (setup_global_atmosphere)")
     for prop, val in cfg.items():
         try:
             setattr(s, prop, val)
@@ -1332,7 +1377,7 @@ def spawn_ambient_audio(cx, cy, z=150, style="silent_hill", radius=1500,
     Exemple :
         spawn_ambient_audio(700, 0, style="silent_hill")
     """
-    path = AMBIENT_AUDIO_BY_STYLE.get(style, AMBIENT_AUDIO_BY_STYLE["silent_hill"])
+    path = _resolve_style(AMBIENT_AUDIO_BY_STYLE, style, "AMBIENT_AUDIO_BY_STYLE")
     sound = unreal.load_asset(path)
     if sound is None:
         unreal.log_warning("[horror_presets] son ambiant introuvable: " + path)
@@ -1502,7 +1547,7 @@ def setup_horror_room(style="silent_hill", zone_name="Salle_Demo",
 
     # ── 4. POINT LIGHTS ────────────────────────────────────────────────────────
     try:
-        palette = _LIGHT_PALETTES.get(style, _LIGHT_PALETTES["silent_hill"])
+        palette = _resolve_style(_LIGHT_PALETTES, style, "_LIGHT_PALETTES (setup_horror_room)")
         for ox, oy, lz, intensity, rgb, radius, suffix in palette:
             point_light(cx + ox, cy + oy, lz,
                         intensity=intensity, rgb=rgb,
@@ -1517,11 +1562,7 @@ def setup_horror_room(style="silent_hill", zone_name="Salle_Demo",
     # donc jamais de brouillard, alors que HORROR_DESIGN.md et le style Silent Hill
     # en particulier en dépendent pour l'ambiance (brouillard qui mange le champ moyen).
     try:
-        fog_cfg = {
-            "silent_hill": dict(density=0.018, inscatter_color=(0.04, 0.04, 0.06), start_distance=80),
-            "outlast":     dict(density=0.008, inscatter_color=(0.02, 0.02, 0.03), start_distance=30),
-            "amnesia":     dict(density=0.012, inscatter_color=(0.05, 0.04, 0.02), start_distance=60),
-        }.get(style, dict(density=0.018, inscatter_color=(0.04, 0.04, 0.06), start_distance=80))
+        fog_cfg = _resolve_style(FOG_PRESETS, style, "FOG_PRESETS (setup_horror_room)")
         add_height_fog(**fog_cfg, label=f"{zone_name}_Fog")
         rapport.append(f"✅ 4b. Fog '{style}' appliqué (density={fog_cfg['density']})")
     except Exception as e:
@@ -1558,7 +1599,7 @@ def setup_horror_room(style="silent_hill", zone_name="Salle_Demo",
     # ── 6. PROPS (après ennemi) ────────────────────────────────────────────────
     if with_props:
         try:
-            props_list = _PROPS_BY_STYLE.get(style, _PROPS_BY_STYLE["silent_hill"])
+            props_list = _resolve_style(_PROPS_BY_STYLE, style, "_PROPS_BY_STYLE")
             placed = 0
             for mesh_path, ox, oy, oz, yaw, suffix in props_list:
                 a = place_static_mesh(mesh_path, cx + ox, cy + oy, oz,
@@ -1606,24 +1647,38 @@ def setup_horror_room(style="silent_hill", zone_name="Salle_Demo",
 
 
 def setup_horror_corridor_full(x1, x2, cy=0, width=500,
-                                style="silent_hill", seed=42):
+                                style="silent_hill", seed=42, axis="x"):
     """Crée un couloir horror complet : géométrie + matériaux + lumières + props.
 
-    x1, x2 : début et fin du couloir (axe X)
-    cy      : centre Y
+    x1, x2 : début et fin du couloir le long de l'axe de déplacement (voir `axis`)
+    cy      : centre sur l'axe perpendiculaire (Y si axis="x", X si axis="y")
     width   : largeur
-    style   : 'silent_hill' | 'outlast' | 'amnesia'
+    style   : 'silent_hill' | 'outlast' | 'amnesia' | 'alan_wake'
+    axis    : 'x' (défaut, couloir horizontal, comportement inchangé) ou 'y' (couloir
+              vertical — ajouté le 2026-07-20 pour les embranchements perpendiculaires
+              de execute_level_plan(), paramètre 'anchor'). `generate_corridor()` côté
+              plugin C++ accepte déjà deux Vector arbitraires ; seule cette enveloppe
+              Python supposait l'axe X jusqu'ici.
     """
-    rapport = [f"=== setup_horror_corridor_full x={x1}->{x2} ==="]
-    cx = (x1 + x2) / 2
+    if axis not in ("x", "y"):
+        raise ValueError("setup_horror_corridor_full: axis doit etre 'x' ou 'y', recu {!r}".format(axis))
+
+    rapport = [f"=== setup_horror_corridor_full axis={axis} {x1}->{x2} (cross={cy}) ==="]
+    along_center = (x1 + x2) / 2
     length = abs(x2 - x1)
-    zone_name = f"Corr_{int(cx)}"
+    # Prefixe de zone inchangé pour axis="x" (compat totale avec les plans/niveaux
+    # existants) ; prefixé "Y" pour axis="y" pour éviter une collision de nom si un
+    # couloir horizontal et un couloir vertical partagent le même centre le long.
+    zone_name = f"Corr_{int(along_center)}" if axis == "x" else f"CorrY_{int(along_center)}"
+    wx1, wy1 = (x1, cy) if axis == "x" else (cy, x1)
+    wx2, wy2 = (x2, cy) if axis == "x" else (cy, x2)
+    world_cx, world_cy = (along_center, cy) if axis == "x" else (cy, along_center)
 
     # 1. Géométrie
     try:
         sub = unreal.get_editor_subsystem(unreal.RoomGeneratorSubsystem)
-        sub.generate_corridor(unreal.Vector(x1, cy, 0),
-                              unreal.Vector(x2, cy, 0),
+        sub.generate_corridor(unreal.Vector(wx1, wy1, 0),
+                              unreal.Vector(wx2, wy2, 0),
                               width, 300, 30, zone_name)
         rapport.append("✅ 1. Géométrie couloir")
     except Exception as e:
@@ -1646,11 +1701,12 @@ def setup_horror_corridor_full(x1, x2, cy=0, width=500,
     # 4. Lampes clignotantes + lueur rouge
     try:
         n_lamps = max(1, int(length / 600))
-        atmosphere_flickering_lamps(cx, cy, z_lamp=270,
+        atmosphere_flickering_lamps(world_cx, world_cy, z_lamp=270,
                                     count=n_lamps, spacing=int(length / n_lamps))
         for i in range(2):
-            px = x1 + (x2 - x1) * (0.25 + i * 0.5)
-            point_light(px, cy, 150, intensity=150,
+            along_pt = x1 + (x2 - x1) * (0.25 + i * 0.5)
+            px, py = (along_pt, cy) if axis == "x" else (cy, along_pt)
+            point_light(px, py, 150, intensity=150,
                         rgb=(180, 20, 10), radius=250,
                         label=f"{zone_name}_RedGlow_{i}")
         rapport.append(f"✅ 4. {n_lamps} lampes + 2 lueurs rouges")
@@ -1659,7 +1715,7 @@ def setup_horror_corridor_full(x1, x2, cy=0, width=500,
 
     # 5. Props debris le long des murs
     try:
-        dress_corridor_horror(x1, x2, cy=cy, width=width, seed=seed)
+        dress_corridor_horror(x1, x2, cy=cy, width=width, seed=seed, axis=axis)
         rapport.append("✅ 5. Props debris")
     except Exception as e:
         rapport.append(f"❌ 5. Props ERREUR: {e}")
@@ -1681,6 +1737,75 @@ def setup_horror_corridor_full(x1, x2, cy=0, width=500,
 # l'application de fix_all()/run_verify() à la fin sont automatiques.
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _compute_step_bounds(axis, along_start, direction, size_along, cross_center, cross_size):
+    """Calcule la bounding-box monde (x_min,x_max,y_min,y_max,cx,cy) d'un step room/corridor
+    a partir de sa position de depart le long de `axis` et de sa taille. Fonction PURE
+    (aucun acteur UE5, aucun effet de bord) extraite le 2026-07-20 du corps de
+    execute_level_plan() pour etre testable isolement — voir test_suite.py.
+
+    axis          : "x" ou "y" — l'axe le long duquel `size_along` s'applique
+    along_start   : coordonnee de depart le long de `axis`
+    direction     : +1 (s'etend vers les coordonnees croissantes) ou -1 (decroissantes)
+    size_along    : taille le long de `axis` (size_x/size_y pour une salle, length pour
+                    un couloir)
+    cross_center  : centre sur l'axe perpendiculaire
+    cross_size    : taille sur l'axe perpendiculaire (l'autre size_x/size_y pour une
+                    salle, width pour un couloir)
+    """
+    if direction > 0:
+        along_min, along_max = along_start, along_start + size_along
+    else:
+        along_min, along_max = along_start - size_along, along_start
+    cross_min, cross_max = cross_center - cross_size / 2, cross_center + cross_size / 2
+
+    if axis == "x":
+        x_min, x_max, y_min, y_max = along_min, along_max, cross_min, cross_max
+    else:
+        x_min, x_max, y_min, y_max = cross_min, cross_max, along_min, along_max
+    cx, cy = (x_min + x_max) / 2, (y_min + y_max) / 2
+    return x_min, x_max, y_min, y_max, cx, cy
+
+
+def _resolve_anchor(zone_geo, anchor, gap):
+    """Calcule le point de depart d'un step "ancre" a une zone deja construite dans
+    CE plan — voir execute_level_plan(), parametre "anchor". Ajoute le 2026-07-20 pour
+    permettre un embranchement/coude en un seul appel (avant : chainage 1D strict sur
+    X, un layout en L/etoile demandait plusieurs appels a execute_level_plan avec des
+    start_x differents — toujours possible, mais plus seulement obligatoire).
+
+    anchor = {"zone": <nom deja construit dans ce plan>, "side": "east"|"west"|"north"|"south"}
+
+    Retourne (axis, along_start, direction, cross_default) :
+      axis          : "x" (east/west, embranchement horizontal) ou "y" (north/south,
+                      embranchement vertical)
+      along_start   : coordonnee de depart le long de `axis`, le `gap` deja applique
+      direction     : +1 (east/north, s'eloigne dans le sens positif) ou -1 (west/south)
+      cross_default : centre par defaut sur l'axe perpendiculaire (= centre de la zone
+                      ancre sur cet axe) — remplacable par step["cx"] (si axis="y") ou
+                      step["cy"] (si axis="x")
+    """
+    zname = anchor.get("zone")
+    side = anchor.get("side")
+    if zname not in zone_geo:
+        raise ValueError(
+            "execute_level_plan: anchor['zone']='{}' inconnue — doit etre une zone DEJA "
+            "construite plus haut dans ce meme plan. Zones connues a ce stade : {}".format(
+                zname, sorted(zone_geo.keys())))
+    geo = zone_geo[zname]
+    if side == "east":
+        return "x", geo["x_max"] + gap, 1, geo["cy"]
+    elif side == "west":
+        return "x", geo["x_min"] - gap, -1, geo["cy"]
+    elif side == "north":
+        return "y", geo["y_max"] + gap, 1, geo["cx"]
+    elif side == "south":
+        return "y", geo["y_min"] - gap, -1, geo["cx"]
+    else:
+        raise ValueError(
+            "execute_level_plan: anchor['side']='{}' invalide — attendu "
+            "'east'/'west'/'north'/'south'.".format(side))
+
+
 def execute_level_plan(plan, start_x=0, cy=0, gap=100, verify_at_end=True,
                         use_verified_build=True, max_passes=3):
     """Exécute une séquence de salles/couloirs définie par un plan JSON.
@@ -1690,17 +1815,33 @@ def execute_level_plan(plan, start_x=0, cy=0, gap=100, verify_at_end=True,
        "size_x": int, "size_y": int (opt, def 1200), "height": int (opt, def 300),
        "with_enemy": bool (opt), "with_props": bool (opt), "cy": int (opt, override Y),
        "max_passes": int (opt, override le défaut de la fonction pour cette zone),
-       "capture_pos": (x,y,z,pitch,yaw,roll) (opt, override la position de capture)}
+       "capture_pos": (x,y,z,pitch,yaw,roll) (opt, override la position de capture),
+       "anchor": {"zone": str, "side": "east"|"west"|"north"|"south"} (opt, voir plus bas)}
       {"type": "corridor", "zone_name": str, "style": str,
        "length": int, "width": int (opt, def 500), "cy": int (opt, override Y),
-       "max_passes": int (opt), "capture_pos": tuple (opt)}
+       "max_passes": int (opt), "capture_pos": tuple (opt), "anchor": {...} (opt)}
 
-    Les positions X sont calculées automatiquement en chaînant les éléments les uns
-    après les autres le long de l'axe X, séparés de `gap` UU. cy=0 par défaut, mais
-    chaque élément peut définir son propre "cy" pour un layout non-linéaire (coude,
-    embranchement) — dans ce cas la suite du plan repart de la dernière position X
-    utilisée, pas de la position Y (le chaînage reste 1D sur X, un plan en L ou en
-    étoile nécessite plusieurs appels à execute_level_plan avec des start_x différents).
+    Chaînage par défaut (comportement inchangé depuis 2026-07-03) : sans "anchor", les
+    positions X sont calculées automatiquement en chaînant les éléments le long de l'axe
+    X, séparés de `gap` UU. cy=0 par défaut, chaque élément peut définir son propre "cy".
+
+    Embranchement/coude — "anchor" (ajouté 2026-07-20) : un step peut démarrer depuis le
+    bord d'une zone DÉJÀ construite plus haut dans ce même plan au lieu de continuer la
+    chaîne X séquentielle :
+        {"anchor": {"zone": "Manoir_Hall", "side": "north"}, ...}
+    "side" détermine l'axe et le sens : "east"/"west" prolongent horizontalement (axe X)
+    depuis le bord est/ouest de la zone ancre ; "north"/"south" prolongent verticalement
+    (axe Y) depuis son bord nord/sud. Le centre sur l'axe perpendiculaire reprend celui
+    de la zone ancre par défaut (remplaçable via "cx" ou "cy" selon le cas). Une fois
+    construit, CE step devient lui-même une zone ancrable pour un step suivant (chaîner
+    plusieurs éléments dans une même branche) — sa position est enregistrée dans
+    result["zone_geo"] comme toute autre zone. Un step ancré ne touche JAMAIS le curseur
+    séquentiel X principal : la suite du plan qui n'utilise pas "anchor" continue
+    exactement comme si la branche n'avait pas existé. Ceci remplace l'ancienne limite
+    "un plan en L/étoile nécessite plusieurs appels à execute_level_plan avec des start_x
+    différents" — cette approche multi-appels reste possible et parfois plus simple pour
+    des branches totalement indépendantes, mais n'est plus la SEULE option pour un layout
+    non-linéaire en un seul appel.
 
     use_verified_build : si True (défaut, depuis 2026-07-08), chaque salle/couloir passe
       par verify_level.verified_zone_build() — boucle fermée build -> fix_all() -> checks
@@ -1718,26 +1859,32 @@ def execute_level_plan(plan, start_x=0, cy=0, gap=100, verify_at_end=True,
     max_passes : plafond de relance auto-correctrice par zone quand use_verified_build=True
       (voir verified_zone_build). Peut être surchargé par zone via step["max_passes"].
 
-    Exemple :
+    Exemple (chaîne + embranchement en un seul appel) :
         plan = [
             {"type": "room", "zone_name": "Manoir_Hall", "style": "amnesia",
              "size_x": 1400, "size_y": 1200, "with_enemy": False},
             {"type": "corridor", "zone_name": "Manoir_Corr1", "style": "amnesia", "length": 800},
             {"type": "room", "zone_name": "Manoir_Salon", "style": "amnesia",
              "size_x": 1200, "size_y": 1200},
-            {"type": "corridor", "zone_name": "Manoir_Corr2", "style": "outlast", "length": 600},
-            {"type": "room", "zone_name": "Manoir_Cave", "style": "outlast",
-             "size_x": 1400, "size_y": 1400},
+            # embranchement perpendiculaire depuis Manoir_Hall, ne touche pas la chaîne X ci-dessus
+            {"type": "corridor", "zone_name": "Manoir_CorrNord", "style": "outlast", "length": 600,
+             "anchor": {"zone": "Manoir_Hall", "side": "north"}},
+            {"type": "room", "zone_name": "Manoir_Grenier", "style": "outlast",
+             "size_x": 1000, "size_y": 1000,
+             "anchor": {"zone": "Manoir_CorrNord", "side": "north"}},
         ]
         execute_level_plan(plan, start_x=0)
 
     Retourne un dict {"reports": [...], "final_x": ..., "verify_ok": bool|None,
-      "screenshots": [...], "qc_pending": [...]}. "reports[i]['report']" est le dict
-      verified_zone_build()
+      "screenshots": [...], "qc_pending": [...], "zone_geo": {...}}. "reports[i]['report']"
+      est le dict verified_zone_build()
       ({"zone_name","errors","warnings","screenshot","passes","structural_pass","qc_manifest"}) si
       use_verified_build=True, ou la string rapport de setup_horror_room()/
       setup_horror_corridor_full() sinon (comportement pré-2026-07-08 inchangé).
       "screenshots" liste tous les screenshots par zone (vide si use_verified_build=False).
+      "zone_geo" (ajouté 2026-07-20) : {"NomZone": {"x_min","x_max","y_min","y_max","cx","cy"}}
+      pour chaque zone construite — c'est ce registre qu'"anchor" consulte pour brancher un
+      step suivant sur une zone de ce plan ; exposé pour debug/inspection après coup.
 
       "qc_pending" (ajouté 2026-07-08) : liste des zones de CE plan qui n'ont pas encore
       (qc_gate PASS + lecture visuelle confirmée) dans Saved/QC/qc_manifest.json — audit
@@ -1751,6 +1898,7 @@ def execute_level_plan(plan, start_x=0, cy=0, gap=100, verify_at_end=True,
     reports = []
     screenshots = []
     built_zone_names = []
+    zone_geo = {}
 
     verified_zone_build = None
     if use_verified_build:
@@ -1761,21 +1909,34 @@ def execute_level_plan(plan, start_x=0, cy=0, gap=100, verify_at_end=True,
         step_type = step.get("type", "room")
         zone_name = step.get("zone_name", f"Zone_{i}")
         style = step.get("style", "silent_hill")
-        step_cy = step.get("cy", cy)
         step_max_passes = step.get("max_passes", max_passes)
         step_capture_pos = step.get("capture_pos")
+        anchor = step.get("anchor")
+
+        # Resolution de la position de depart — chainage X sequentiel par defaut
+        # (comportement inchange), ou embranchement via "anchor" (voir docstring).
+        if anchor:
+            axis, along_start, direction, cross_default = _resolve_anchor(zone_geo, anchor, gap)
+        else:
+            axis, along_start, direction, cross_default = "x", x, 1, cy
 
         if step_type == "room":
             size_x = step.get("size_x", 1200)
             size_y = step.get("size_y", 1200)
             height = step.get("height", 300)
-            cx = x + size_x / 2
-            x_min, x_max = x, x + size_x
+            size_along = size_x if axis == "x" else size_y
+            cross_size = size_y if axis == "x" else size_x
+            cross_key  = "cy" if axis == "x" else "cx"
+            cross_center = step.get(cross_key, cross_default)
 
-            def build_fn(cx=cx, style=style, zone_name=zone_name, step_cy=step_cy,
+            x_min, x_max, y_min, y_max, cx, cy_final = _compute_step_bounds(
+                axis, along_start, direction, size_along, cross_center, cross_size)
+            along_max = x_max if axis == "x" else y_max
+
+            def build_fn(cx=cx, cy_final=cy_final, style=style, zone_name=zone_name,
                          size_x=size_x, size_y=size_y, height=height, step=step):
                 return setup_horror_room(
-                    style=style, zone_name=zone_name, cx=cx, cy=step_cy,
+                    style=style, zone_name=zone_name, cx=cx, cy=cy_final,
                     size_x=size_x, size_y=size_y, height=height,
                     with_enemy=step.get("with_enemy", True),
                     with_props=step.get("with_props", True),
@@ -1784,7 +1945,7 @@ def execute_level_plan(plan, start_x=0, cy=0, gap=100, verify_at_end=True,
 
             if use_verified_build:
                 zresult = verified_zone_build(
-                    build_fn, zone_name, x_min=x_min, x_max=x_max, cx=cx, cy=step_cy,
+                    build_fn, zone_name, x_min=x_min, x_max=x_max, cx=cx, cy=cy_final,
                     style=style, max_passes=step_max_passes, capture_pos=step_capture_pos,
                 )
                 if zresult.get("screenshot"):
@@ -1792,22 +1953,32 @@ def execute_level_plan(plan, start_x=0, cy=0, gap=100, verify_at_end=True,
                 built_zone_names.append(zone_name)
             else:
                 zresult = build_fn()
-            reports.append({"zone_name": zone_name, "type": "room", "cx": cx, "cy": step_cy,
+            reports.append({"zone_name": zone_name, "type": "room", "cx": cx, "cy": cy_final,
                             "report": zresult})
-            x = cx + size_x / 2 + gap
+            zone_geo[zone_name] = {"x_min": x_min, "x_max": x_max, "y_min": y_min, "y_max": y_max,
+                                    "cx": cx, "cy": cy_final}
+            if anchor is None:
+                x = along_max + gap
 
         elif step_type == "corridor":
             length = step.get("length", 800)
             width = step.get("width", 500)
-            x1, x2 = x, x + length
-            cx = (x1 + x2) / 2
+            cross_key = "cy" if axis == "x" else "cx"
+            cross_center = step.get(cross_key, cross_default)
 
-            def build_fn(x1=x1, x2=x2, step_cy=step_cy, width=width, style=style):
-                return setup_horror_corridor_full(x1, x2, cy=step_cy, width=width, style=style)
+            x_min, x_max, y_min, y_max, cx, cy_final = _compute_step_bounds(
+                axis, along_start, direction, length, cross_center, width)
+            along_min = x_min if axis == "x" else y_min
+            along_max = x_max if axis == "x" else y_max
+
+            def build_fn(along_min=along_min, along_max=along_max, cross_center=cross_center,
+                         width=width, style=style, axis=axis):
+                return setup_horror_corridor_full(along_min, along_max, cy=cross_center,
+                                                   width=width, style=style, axis=axis)
 
             if use_verified_build:
                 zresult = verified_zone_build(
-                    build_fn, zone_name, x_min=x1, x_max=x2, cx=cx, cy=step_cy,
+                    build_fn, zone_name, x_min=x_min, x_max=x_max, cx=cx, cy=cy_final,
                     style=style, max_passes=step_max_passes, capture_pos=step_capture_pos,
                 )
                 if zresult.get("screenshot"):
@@ -1815,9 +1986,12 @@ def execute_level_plan(plan, start_x=0, cy=0, gap=100, verify_at_end=True,
                 built_zone_names.append(zone_name)
             else:
                 zresult = build_fn()
-            reports.append({"zone_name": zone_name, "type": "corridor", "x1": x1, "x2": x2,
+            reports.append({"zone_name": zone_name, "type": "corridor", "x1": x_min, "x2": x_max,
                             "report": zresult})
-            x = x2 + gap
+            zone_geo[zone_name] = {"x_min": x_min, "x_max": x_max, "y_min": y_min, "y_max": y_max,
+                                    "cx": cx, "cy": cy_final}
+            if anchor is None:
+                x = along_max + gap
 
         else:
             reports.append({"zone_name": zone_name, "type": step_type,
@@ -1882,7 +2056,7 @@ def execute_level_plan(plan, start_x=0, cy=0, gap=100, verify_at_end=True,
                   f"qc_gate PASS + lecture visuelle confirmée dans le manifest QC.")
 
     return {"reports": reports, "final_x": x, "verify_ok": verify_ok, "screenshots": screenshots,
-            "qc_pending": qc_pending}
+            "qc_pending": qc_pending, "zone_geo": zone_geo}
 
 
 def fix_existing_level(style="silent_hill"):
@@ -1934,7 +2108,7 @@ def fix_existing_level(style="silent_hill"):
     lights = [a for a in aeas_sub.get_all_level_actors()
               if 'PointLight' in a.get_class().get_name()]
     if len(lights) == 0:
-        palette = _LIGHT_PALETTES.get(style, _LIGHT_PALETTES["silent_hill"])
+        palette = _resolve_style(_LIGHT_PALETTES, style, "_LIGHT_PALETTES (fix_existing_level)")
         for ox, oy, lz, intensity, rgb, radius, suffix in palette:
             point_light(ox, oy, lz, intensity=intensity, rgb=rgb,
                         radius=radius, label=f"Fixed_{suffix}")

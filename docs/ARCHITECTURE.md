@@ -7,7 +7,19 @@ in-editor Slate panel backed by the Anthropic API (for standalone use without
 an external agent session), and an MCP bridge that lets an external agent
 (Claude Code, or any MCP-capable agent) call into the editor's embedded
 Python interpreter directly. Both ultimately execute Python inside
-`IPythonScriptPlugin`.
+`IPythonScriptPlugin`. The in-editor panel can optionally attach a screenshot
+of the current viewport (at the exact camera pose the panel's own Python
+helper reports) to the next outgoing message, reusing the same
+`capture_reference_screenshot()` pipeline the rest of this toolchain relies
+on rather than a separate C++ capture path. This is off by default and gated
+behind its own checkbox: the panel's Anthropic key is billed independently
+of any agent subscription driving the MCP bridge, so vision is opt-in rather
+than attached to every message. The capture-and-attach code path itself
+compiles and runs end-to-end (verified by exercising the underlying Python
+helper directly); the actual round trip to the API with an image attached
+has not been exercised with a real request, so "the wiring exists" and "the
+model has been confirmed to see the screenshot" are two different claims —
+only the first one currently holds.
 
 **RoomGenerator plugin (C++, Editor Subsystem).**
 - `RoomGeneratorSubsystem` — procedural room/corridor geometry generation
@@ -33,7 +45,27 @@ Python interpreter directly. Both ultimately execute Python inside
   subsystems and the Python toolchain itself.
 - `horror_presets.py` — reusable room/corridor/atmosphere templates and a
   small plan executor (`execute_level_plan`) that chains rooms and corridors
-  along an axis from a structured JSON plan.
+  from a structured JSON plan. Chaining defaults to a single axis (each step
+  starts where the previous one ended), but a step can instead declare an
+  `"anchor"` — the name of an already-built step in the same plan plus a
+  side (`east`/`west`/`north`/`south`) — to branch off that step's edge on
+  the perpendicular axis instead of continuing the main sequence. This turns
+  a single `execute_level_plan()` call into a real (if still simple) 2D
+  layout tool: a corridor can turn a corner, or a room can grow a side
+  branch, without a second top-level call and without disturbing the main
+  chain's position bookkeeping. The bounds/anchor math
+  (`_compute_step_bounds`, `_resolve_anchor`) is deliberately factored out as
+  pure functions with no engine calls, specifically so it can be unit-tested
+  without ever touching a real level — the alternative (calling the real
+  room-building functions to test geometry math) would mean every test run
+  mutates the currently open level's actual lighting/post-process state,
+  which nothing in this codebase wants as a side effect of running the test
+  suite. The orchestration layer above that math (does the executor call the
+  right builder for the right step, in the right order, with the right
+  registered bounds) is covered separately by an integration test that
+  temporarily substitutes fake builder functions, so the full call path
+  through `execute_level_plan()` is exercised without generating any real
+  geometry.
 
 **Standalone QA/CI tooling (`Tools/`, ~800 lines, run outside the editor).**
 - `analyze_screenshot.py` — numeric perceptual check on an exported

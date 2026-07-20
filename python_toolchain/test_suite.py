@@ -165,7 +165,7 @@ def _test_bgh(bp):
 
 def _test_ue5_utils(bp):
     try:
-        from ue5_utils import aeas, bpes, bgh, BPGraph, compile_bp
+        from ue5_utils import aeas, bpes, bgh, BPGraph, load_bp, compile_bp
     except Exception as e:
         _results.append((_FAIL, "ue5_utils import", str(e)))
         return
@@ -941,6 +941,300 @@ def _test_check_qc_pending():
 
 
 # ─────────────────────────────────────────────────────────────
+# Trust Gate — quorum multi-canaux (ajoute 2026-07-14, voir CLAUDE.md +
+# Tools/trust_gate.py). Fichier de test dedie sous Saved/Temp/TrustGateTests/,
+# jamais un vrai fichier du projet -- nettoyage garanti des sidecars et du
+# fichier de test dans le finally, la vraie base trust_gate (Saved/QC/
+# trust_readings/) n'est jamais touchee en dehors de la cle de ce fichier de
+# test precis.
+# ─────────────────────────────────────────────────────────────
+
+def _test_trust_gate():
+    try:
+        import ue5_utils as _u
+        tg = _u._load_trust_gate()
+    except Exception as e:
+        _results.append((_FAIL, "trust_gate import", str(e)))
+        return
+
+    tmp_dir = os.path.join(unreal.Paths.project_saved_dir(), "Temp", "TrustGateTests")
+    os.makedirs(tmp_dir, exist_ok=True)
+    test_file = os.path.join(tmp_dir, "_ts_trust_gate_target.txt")
+
+    def _sidecars_for(path):
+        key = tg._reading_key(path)
+        d = tg.READINGS_DIR
+        if not os.path.isdir(d):
+            return []
+        return [os.path.join(d, f) for f in os.listdir(d) if f.startswith(key + "__")]
+
+    try:
+        for p in _sidecars_for(test_file):
+            os.remove(p)
+        with open(test_file, "w", encoding="utf-8") as f:
+            f.write("version 1\n")
+
+        v0 = tg.compare_readings(test_file)
+        _test("trust_gate - aucune lecture enregistree -> UNVERIFIED",
+              lambda: v0["verdict"] == "UNVERIFIED")
+
+        r1 = tg.record_reading(test_file, "backendA", note="test1")
+        _test("trust_gate - record_reading reussit et retourne un sha256",
+              lambda: r1.get("ok") is True and len(r1.get("sha256", "")) == 64)
+
+        v1 = tg.compare_readings(test_file)
+        _test("trust_gate - une seule lecture enregistree -> UNVERIFIED (pas de quorum)",
+              lambda: v1["verdict"] == "UNVERIFIED")
+
+        r2 = tg.record_reading(test_file, "backendB", note="test2")
+        v2 = tg.compare_readings(test_file)
+        _test("trust_gate - deux backends d'accord -> TRUSTED",
+              lambda: v2["verdict"] == "TRUSTED")
+        _test("trust_gate - TRUSTED rapporte le sha256 commun aux deux backends",
+              lambda: v2.get("sha256") == r1["sha256"] == r2["sha256"])
+
+        with open(test_file, "w", encoding="utf-8") as f:
+            f.write("version 2 -- contenu different\n")
+        tg.record_reading(test_file, "backendA", note="test3 (fichier modifie, backendB pas encore resynchronise)")
+        v3 = tg.compare_readings(test_file)
+        _test("trust_gate - backends en desaccord -> DIVERGENT (quarantaine)",
+              lambda: v3["verdict"] == "DIVERGENT")
+        _test("trust_gate - DIVERGENT liste bien 2 groupes de hash distincts",
+              lambda: len(v3.get("hash_groups", {})) == 2)
+
+        ledger = tg.check_ledger(paths=[test_file])
+        _test("trust_gate - check_ledger detecte la divergence sur ce fichier",
+              lambda: ledger["verdict"] == "DIVERGENCE_DETECTED")
+
+        # Bug reel rencontre en construisant ce mecanisme (voir CLAUDE.md 2026-07-14) :
+        # la premiere version de _reading_key() cle-ait sur le chemin ABSOLU, donc
+        # bash_sandbox et ue5_native (deux racines absolues totalement differentes
+        # pour le meme fichier) n'etaient jamais compares ensemble -- verdict
+        # UNVERIFIED en boucle au lieu de TRUSTED/DIVERGENT. Regression a ne plus
+        # jamais reproduire.
+        rel = os.path.relpath(test_file, tg.ROOT).replace("\\", "/")
+        _test("trust_gate - meme cle en chemin relatif et absolu (non-regression du bug de keying)",
+              lambda: tg._reading_key(test_file) == tg._reading_key(rel))
+
+        tg.record_reading(test_file, "backendB", note="test4 (re-sync)")
+        v4 = tg.compare_readings(test_file)
+        _test("trust_gate - re-synchronisation des deux backends -> retour a TRUSTED",
+              lambda: v4["verdict"] == "TRUSTED")
+    finally:
+        for p in _sidecars_for(test_file):
+            try:
+                os.remove(p)
+            except Exception:
+                pass
+        try:
+            if os.path.exists(test_file):
+                os.remove(test_file)
+        except Exception:
+            pass
+
+
+def _test_horror_presets_style_resolution():
+    """Couvre le fix du 2026-07-20 (voir CLAUDE.md) : ~8 endroits de horror_presets.py
+    faisaient chacun leur propre `X.get(style, X["silent_hill"])` sans avertissement —
+    remplace par _resolve_style(), centralise. Le bug reel trouve en l'ecrivant (fog de
+    'alan_wake' absent depuis la creation du style, silencieusement remplace par celui
+    de silent_hill) est couvert explicitement pour ne jamais pouvoir regresser sans
+    qu'un test ne le voie."""
+    try:
+        import horror_presets as hp
+    except Exception as e:
+        _results.append((_FAIL, "horror_presets import", str(e)))
+        return
+
+    _test("horror_presets - _resolve_style retourne l'entree exacte quand le style existe",
+          lambda: hp._resolve_style(hp.WALL_PRESETS, "outlast", "TEST") is hp.WALL_PRESETS["outlast"])
+
+    _test("horror_presets - _resolve_style retombe sur silent_hill pour un style inconnu",
+          lambda: hp._resolve_style(hp.WALL_PRESETS, "style_qui_nexiste_pas_zzz", "TEST")
+                  is hp.WALL_PRESETS["silent_hill"])
+
+    _test("horror_presets - _resolve_style ne leve jamais d'exception sur un style inconnu",
+          lambda: (hp._resolve_style(hp.PP_PRESETS, "", "TEST"), True)[1])
+
+    # Regression directe du bug reel : FOG_PRESETS doit avoir 'alan_wake' (absent avant ce
+    # fix -- silencieusement remplace par le fog de silent_hill dans setup_horror_room()).
+    _test("horror_presets - FOG_PRESETS contient 'alan_wake' (ex-bug : absent, jamais signale)",
+          lambda: "alan_wake" in hp.FOG_PRESETS)
+
+    # Les 4 styles connus doivent etre presents et COHERENTS dans les 6 dicts par style —
+    # exactement la classe de bug qui a permis a 'alan_wake' de manquer dans un seul dict
+    # (FOG_PRESETS) pendant que les 5 autres l'avaient deja. Si un futur style est ajoute
+    # dans un dict mais pas un autre, ce test le detecte immediatement au lieu d'attendre
+    # qu'un agent le remarque visuellement en PIE.
+    style_dicts = {
+        "WALL_PRESETS": hp.WALL_PRESETS,
+        "PP_PRESETS": hp.PP_PRESETS,
+        "FOG_PRESETS": hp.FOG_PRESETS,
+        "_LIGHT_PALETTES": hp._LIGHT_PALETTES,
+        "_PROPS_BY_STYLE": hp._PROPS_BY_STYLE,
+        "AMBIENT_AUDIO_BY_STYLE": hp.AMBIENT_AUDIO_BY_STYLE,
+    }
+    known_styles = set(hp.WALL_PRESETS.keys())
+
+    def _all_dicts_have_all_styles():
+        for dict_name, d in style_dicts.items():
+            missing = known_styles - set(d.keys())
+            if missing:
+                raise Exception("{} manque {} par rapport a WALL_PRESETS".format(dict_name, missing))
+        return True
+
+    _test("horror_presets - les 6 dicts par style ont exactement le meme jeu de styles",
+          _all_dicts_have_all_styles)
+
+
+def _test_execute_level_plan_geometry():
+    """Couvre le fix du 2026-07-20 (embranchement/coude 2D, voir CLAUDE.md) : la logique
+    de positionnement de execute_level_plan() (_compute_step_bounds, _resolve_anchor) a
+    ete extraite en fonctions PURES (aucun acteur UE5) precisement pour pouvoir la tester
+    sans jamais appeler setup_horror_room()/execute_level_plan() elle-meme -- CETTE
+    derniere modifie l'atmosphere GLOBALE du niveau reellement ouvert (PostProcess/fog/
+    lumieres, via setup_global_atmosphere()) et n'est donc JAMAIS appelee depuis ce fichier
+    de tests (aucun test existant ne le faisait avant ce fix non plus -- verifie par grep
+    avant d'ecrire ce test, pour ne pas introduire cet effet de bord global en premier)."""
+    try:
+        import horror_presets as hp
+    except Exception as e:
+        _results.append((_FAIL, "horror_presets import (plan geometry)", str(e)))
+        return
+
+    # Non-regression : le chainage 1D par defaut (sans anchor) doit reproduire EXACTEMENT
+    # les anciennes formules ("cx = x + size_x/2" pour une salle, "x1,x2 = x, x+length"
+    # pour un couloir) -- c'est le comportement que tout plan existant continue d'utiliser.
+    def _room_default_chain_unchanged():
+        x_min, x_max, y_min, y_max, cx, cy = hp._compute_step_bounds(
+            "x", along_start=100, direction=1, size_along=1400, cross_center=0, cross_size=1200)
+        return (x_min, x_max, y_min, y_max, cx, cy) == (100, 1500, -600, 600, 800, 0)
+    _test("execute_level_plan - _compute_step_bounds reproduit l'ancienne formule salle (chainage X)",
+          _room_default_chain_unchanged)
+
+    def _corridor_default_chain_unchanged():
+        x_min, x_max, y_min, y_max, cx, cy = hp._compute_step_bounds(
+            "x", along_start=100, direction=1, size_along=800, cross_center=0, cross_size=500)
+        return (x_min, x_max, cx) == (100, 900, 500)
+    _test("execute_level_plan - _compute_step_bounds reproduit l'ancienne formule couloir (chainage X)",
+          _corridor_default_chain_unchanged)
+
+    zone_geo = {"Hall": {"x_min": 0, "x_max": 1400, "y_min": -600, "y_max": 600,
+                          "cx": 700, "cy": 0}}
+
+    def _anchor_north():
+        axis, along_start, direction, cross_default = hp._resolve_anchor(
+            zone_geo, {"zone": "Hall", "side": "north"}, gap=100)
+        return (axis, along_start, direction, cross_default) == ("y", 700, 1, 700)
+    _test("execute_level_plan - anchor 'north' resout axe Y, bord+gap, sens +1", _anchor_north)
+
+    def _anchor_south():
+        axis, along_start, direction, cross_default = hp._resolve_anchor(
+            zone_geo, {"zone": "Hall", "side": "south"}, gap=100)
+        return (axis, along_start, direction, cross_default) == ("y", -700, -1, 700)
+    _test("execute_level_plan - anchor 'south' resout axe Y, bord-gap, sens -1", _anchor_south)
+
+    def _anchor_east():
+        axis, along_start, direction, cross_default = hp._resolve_anchor(
+            zone_geo, {"zone": "Hall", "side": "east"}, gap=100)
+        return (axis, along_start, direction, cross_default) == ("x", 1500, 1, 0)
+    _test("execute_level_plan - anchor 'east' resout axe X, bord+gap, sens +1", _anchor_east)
+
+    def _anchor_west():
+        axis, along_start, direction, cross_default = hp._resolve_anchor(
+            zone_geo, {"zone": "Hall", "side": "west"}, gap=100)
+        return (axis, along_start, direction, cross_default) == ("x", -100, -1, 0)
+    _test("execute_level_plan - anchor 'west' resout axe X, bord-gap, sens -1", _anchor_west)
+
+    def _anchor_unknown_zone_raises():
+        try:
+            hp._resolve_anchor(zone_geo, {"zone": "Inconnue", "side": "north"}, gap=100)
+            return False
+        except ValueError:
+            return True
+    _test("execute_level_plan - anchor vers une zone inconnue leve ValueError (pas de KeyError silencieux)",
+          _anchor_unknown_zone_raises)
+
+    def _anchor_invalid_side_raises():
+        try:
+            hp._resolve_anchor(zone_geo, {"zone": "Hall", "side": "nordouest"}, gap=100)
+            return False
+        except ValueError:
+            return True
+    _test("execute_level_plan - anchor avec 'side' invalide leve ValueError",
+          _anchor_invalid_side_raises)
+
+    # Bout-en-bout geometrique (toujours 100% pur, sans acteur) : une salle 1000x1000
+    # ancree au nord de Hall ne doit jamais overlapper Hall, et son bord sud doit etre
+    # exactement a gap=100 UU du bord nord de Hall (900 700 -> 700, gap=100 => y_min=700).
+    def _anchored_room_no_overlap_with_gap():
+        axis, along_start, direction, cross_default = hp._resolve_anchor(
+            zone_geo, {"zone": "Hall", "side": "north"}, gap=100)
+        x_min, x_max, y_min, y_max, cx, cy = hp._compute_step_bounds(
+            axis, along_start, direction, size_along=1000, cross_center=cross_default, cross_size=1000)
+        gap_reel = y_min - zone_geo["Hall"]["y_max"]
+        no_overlap = y_min >= zone_geo["Hall"]["y_max"]
+        return no_overlap and gap_reel == 100 and (x_min, x_max, y_min, y_max, cx, cy) == (200, 1200, 700, 1700, 700, 1200)
+    _test("execute_level_plan - salle ancree au nord ne chevauche jamais la zone ancre, gap exact respecte",
+          _anchored_room_no_overlap_with_gap)
+
+
+def _test_execute_level_plan_integration():
+    """Integration bout-en-bout de execute_level_plan() lui-meme (pas seulement ses
+    fonctions de calcul pures) SANS jamais appeler setup_horror_room()/
+    setup_horror_corridor_full() reelles -- ces dernieres modifient l'atmosphere GLOBALE
+    du niveau reellement ouvert (PostProcess/fog/lumieres). Meme technique de
+    remplacement temporaire deja utilisee pour tester check_qc_pending() (voir
+    CLAUDE.md, 2026-07-08) : remplacer les deux fonctions de build par de faux stubs,
+    lancer un vrai execute_level_plan() avec use_verified_build=False, restaurer
+    les originales dans un finally (jamais laisser le remplacement fuiter si un
+    assert echoue au milieu)."""
+    try:
+        import horror_presets as hp
+    except Exception as e:
+        _results.append((_FAIL, "horror_presets import (plan integration)", str(e)))
+        return
+
+    def _fake_room(style, zone_name, cx, cy, size_x=1200, size_y=1200, height=300, **kw):
+        return "OK fake room " + zone_name
+
+    def _fake_corridor(x1, x2, cy=0, width=500, style="silent_hill", seed=42, axis="x"):
+        return "OK fake corridor"
+
+    orig_room, orig_corr = hp.setup_horror_room, hp.setup_horror_corridor_full
+    hp.setup_horror_room, hp.setup_horror_corridor_full = _fake_room, _fake_corridor
+
+    try:
+        plan = [
+            {"type": "room", "zone_name": "_TS_Hall", "style": "amnesia", "size_x": 1400, "size_y": 1200},
+            {"type": "corridor", "zone_name": "_TS_Corr1", "style": "amnesia", "length": 800},
+            {"type": "room", "zone_name": "_TS_Salon", "style": "amnesia", "size_x": 1200, "size_y": 1200},
+            # embranchement perpendiculaire depuis _TS_Hall -- ne doit PAS toucher la chaine X ci-dessus
+            {"type": "corridor", "zone_name": "_TS_CorrNord", "style": "outlast", "length": 600,
+             "anchor": {"zone": "_TS_Hall", "side": "north"}},
+            {"type": "room", "zone_name": "_TS_Grenier", "style": "outlast", "size_x": 1000, "size_y": 1000,
+             "anchor": {"zone": "_TS_CorrNord", "side": "north"}},
+        ]
+        result = hp.execute_level_plan(plan, start_x=0, use_verified_build=False, verify_at_end=False)
+        zg = result.get("zone_geo", {})
+
+        _test("execute_level_plan (integration) - final_x inchange par les branches ancrees",
+              lambda: result["final_x"] == 3700)
+        _test("execute_level_plan (integration) - la chaine X ignore completement les branches",
+              lambda: zg["_TS_Salon"]["x_min"] == 2400)
+        _test("execute_level_plan (integration) - branche ancree part du bord+gap de la zone ancre",
+              lambda: zg["_TS_CorrNord"]["y_min"] == zg["_TS_Hall"]["y_max"] + 100)
+        _test("execute_level_plan (integration) - cross_center par defaut = centre de la zone ancre",
+              lambda: zg["_TS_CorrNord"]["cx"] == zg["_TS_Hall"]["cx"])
+        _test("execute_level_plan (integration) - chainage multi-hop dans une branche (2e maillon)",
+              lambda: zg["_TS_Grenier"]["y_min"] == zg["_TS_CorrNord"]["y_max"] + 100)
+        _test("execute_level_plan (integration) - aucun overlap Y entre la zone ancre et sa branche",
+              lambda: zg["_TS_Hall"]["y_max"] <= zg["_TS_CorrNord"]["y_min"])
+    finally:
+        hp.setup_horror_room, hp.setup_horror_corridor_full = orig_room, orig_corr
+
+
+# ─────────────────────────────────────────────────────────────
 # Point d'entree
 # ─────────────────────────────────────────────────────────────
 
@@ -974,6 +1268,10 @@ def run_all(verbose=True):
     _test_file_integrity_guard()
     _test_qc_manifest()
     _test_check_qc_pending()
+    _test_trust_gate()
+    _test_horror_presets_style_resolution()
+    _test_execute_level_plan_geometry()
+    _test_execute_level_plan_integration()
 
     passed = sum(1 for s, _, _ in _results if s == _OK)
     failed = sum(1 for s, _, _ in _results if s == _FAIL)
